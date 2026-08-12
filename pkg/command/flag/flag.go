@@ -87,6 +87,14 @@ func (w Wrapper) GlobalAPIKeyFile(p *string) {
 	w.fs.StringVar(p, "api-key-file", os.Getenv("SCYLLA_MANAGER_API_KEY_FILE"), usage["api-key-file"])
 }
 
+func (w Wrapper) GlobalAPICAFile(p *string) {
+	w.fs.StringVar(p, "api-ca-file", os.Getenv("SCYLLA_MANAGER_API_CA_FILE"), usage["api-ca-file"])
+}
+
+func (w Wrapper) GlobalAPIServerName(p *string) {
+	w.fs.StringVar(p, "api-server-name", os.Getenv("SCYLLA_MANAGER_API_SERVER_NAME"), usage["api-server-name"])
+}
+
 //
 // Common flags
 //

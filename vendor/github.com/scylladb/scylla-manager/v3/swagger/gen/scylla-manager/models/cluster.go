@@ -15,14 +15,53 @@ import (
 // swagger:model Cluster
 type Cluster struct {
 
+	// agent ca file
+	// Format: byte
+	AgentCaFile strfmt.Base64 `json:"agent_ca_file,omitempty"`
+
+	// agent ca set
+	AgentCaSet bool `json:"agent_ca_set,omitempty"`
+
+	// agent server name
+	AgentServerName string `json:"agent_server_name,omitempty"`
+
 	// alternator access key id
 	AlternatorAccessKeyID string `json:"alternator_access_key_id,omitempty"`
+
+	// alternator ca file
+	// Format: byte
+	AlternatorCaFile strfmt.Base64 `json:"alternator_ca_file,omitempty"`
+
+	// alternator ca set
+	AlternatorCaSet bool `json:"alternator_ca_set,omitempty"`
+
+	// alternator credentials set
+	AlternatorCredentialsSet bool `json:"alternator_credentials_set,omitempty"`
 
 	// alternator secret access key
 	AlternatorSecretAccessKey string `json:"alternator_secret_access_key,omitempty"`
 
+	// alternator server name
+	AlternatorServerName string `json:"alternator_server_name,omitempty"`
+
 	// auth token
 	AuthToken string `json:"auth_token,omitempty"`
+
+	// auth token set
+	AuthTokenSet bool `json:"auth_token_set,omitempty"`
+
+	// cql ca file
+	// Format: byte
+	CqlCaFile strfmt.Base64 `json:"cql_ca_file,omitempty"`
+
+	// cql ca set
+	CqlCaSet bool `json:"cql_ca_set,omitempty"`
+
+	// cql credentials set
+	CqlCredentialsSet bool `json:"cql_credentials_set,omitempty"`
+
+	// cql server name
+	CqlServerName string `json:"cql_server_name,omitempty"`
 
 	// force non ssl session port
 	ForceNonSslSessionPort bool `json:"force_non_ssl_session_port,omitempty"`
@@ -51,6 +90,9 @@ type Cluster struct {
 	// ssl user cert file
 	// Format: byte
 	SslUserCertFile strfmt.Base64 `json:"ssl_user_cert_file,omitempty"`
+
+	// ssl user cert set
+	SslUserCertSet bool `json:"ssl_user_cert_set,omitempty"`
 
 	// ssl user key file
 	// Format: byte

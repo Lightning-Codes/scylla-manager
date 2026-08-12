@@ -55,7 +55,10 @@ func TestMain(m *testing.M) {
 		flag.Parse()
 	}
 
-	config := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
+	config, err := ManagedClusterAgentConfigE(ManagedClusterHosts(), AgentAuthToken())
+	if err != nil {
+		panic(err)
+	}
 
 	logger := log.NewDevelopment().Named("Setup")
 	c, err := scyllaclient.NewClient(config, logger)

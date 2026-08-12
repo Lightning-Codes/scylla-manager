@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/pkg/errors"
 	"github.com/scylladb/go-log"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
@@ -157,6 +158,10 @@ func (s *Service) parallelRESTPingFunc(ctx context.Context, clusterID uuid.UUID,
 			ni, err := s.configCache.Read(clusterID, status[i].Addr)
 			if err == nil {
 				rtt, err = s.pingREST(ctx, clusterID, status[i].Addr, s.config.MaxTimeout, ni)
+				// The proxied REST endpoint is protected by the Agent bearer
+				// token. Only its success proves both the strict TLS transport
+				// and an authenticated request over that transport.
+				o.AgentTLSVerified = err == nil
 			}
 
 			o.RESTRtt = float64(rtt.Milliseconds())
@@ -168,8 +173,8 @@ func (s *Service) parallelRESTPingFunc(ctx context.Context, clusterID uuid.UUID,
 				)
 				switch {
 				case rtt == 0:
-					o.CQLStatus = statusError
-					o.CQLCause = err.Error()
+					o.RESTStatus = statusError
+					o.RESTCause = "Agent REST probe failed; see Manager logs with the request trace ID"
 				case errors.Is(err, context.DeadlineExceeded):
 					o.RESTStatus = statusTimeout
 				case scyllaclient.StatusCodeOf(err) == http.StatusUnauthorized:
@@ -178,7 +183,7 @@ func (s *Service) parallelRESTPingFunc(ctx context.Context, clusterID uuid.UUID,
 					o.RESTStatus = fmt.Sprintf("%s %d", statusHTTP, scyllaclient.StatusCodeOf(err))
 				default:
 					o.RESTStatus = statusDown
-					o.RESTCause = err.Error()
+					o.RESTCause = "Agent REST endpoint is unavailable; see Manager logs with the request trace ID"
 				}
 			} else {
 				o.RESTStatus = statusUp
@@ -200,9 +205,10 @@ func (s *Service) parallelCQLPingFunc(ctx context.Context, clusterID uuid.UUID, 
 			}
 
 			rtt := time.Duration(0)
+			authVerified := false
 			ni, err := s.configCache.Read(clusterID, status[i].Addr)
 			if err == nil {
-				rtt, err = s.pingCQL(ctx, clusterID, status[i].Addr, s.config.MaxTimeout, ni)
+				rtt, authVerified, err = s.pingCQLVerified(ctx, clusterID, status[i].Addr, s.config.MaxTimeout, ni)
 			}
 
 			o.CQLRtt = float64(rtt.Milliseconds())
@@ -217,24 +223,22 @@ func (s *Service) parallelCQLPingFunc(ctx context.Context, clusterID uuid.UUID, 
 				switch {
 				case rtt == 0:
 					o.CQLStatus = statusError
-					o.CQLCause = err.Error()
+					o.CQLCause = "CQL probe failed; see Manager logs with the request trace ID"
 				case errors.Is(err, ping.ErrTimeout):
 					o.CQLStatus = statusTimeout
 				case errors.Is(err, ping.ErrUnauthorised):
 					o.CQLStatus = statusUnauthorized
 				default:
 					o.CQLStatus = statusDown
-					o.CQLCause = err.Error()
+					o.CQLCause = "CQL endpoint is unavailable; see Manager logs with the request trace ID"
 				}
 			} else {
 				o.CQLStatus = statusUp
+				o.CQLTLSVerified = ni.CQLTLSConfig() != nil
+				o.CQLAuthVerified = authVerified
 			}
 
-			if ni.NodeInfo == nil {
-				o.SSL = false
-			} else {
-				o.SSL = ni.CQLTLSConfig() != nil
-			}
+			o.SSL = o.CQLTLSVerified
 
 			return nil
 		}, parallel.NopNotify)
@@ -269,17 +273,19 @@ func (s *Service) parallelAlternatorPingFunc(ctx context.Context, clusterID uuid
 				switch {
 				case rtt == 0:
 					o.AlternatorStatus = statusError
-					o.AlternatorCause = err.Error()
+					o.AlternatorCause = "Alternator probe failed; see Manager logs with the request trace ID"
 				case errors.Is(err, ping.ErrTimeout):
 					o.AlternatorStatus = statusTimeout
 				case errors.Is(err, ping.ErrUnauthorised):
 					o.AlternatorStatus = statusUnauthorized
 				default:
 					o.AlternatorStatus = statusDown
-					o.AlternatorCause = err.Error()
+					o.AlternatorCause = "Alternator endpoint is unavailable; see Manager logs with the request trace ID"
 				}
 			} else if rtt != 0 {
 				o.AlternatorStatus = statusUp
+				o.AlternatorTLSVerified = ni.AlternatorTLSConfig() != nil
+				o.AlternatorAuthVerified = ni.NodeInfo != nil && ni.AlternatorEnforceAuthorization
 			}
 			if rtt != 0 {
 				o.AlternatorRtt = float64(rtt.Milliseconds())
@@ -292,7 +298,7 @@ func (s *Service) parallelAlternatorPingFunc(ctx context.Context, clusterID uuid
 
 // pingAlternator sends ping probe and returns RTT.
 // When Alternator frontend is disabled, it returns 0 and nil error.
-func (s *Service) pingAlternator(ctx context.Context, _ uuid.UUID, host string, timeout time.Duration, ni configcache.NodeConfig) (rtt time.Duration, err error) {
+func (s *Service) pingAlternator(ctx context.Context, clusterID uuid.UUID, host string, timeout time.Duration, ni configcache.NodeConfig) (rtt time.Duration, err error) {
 	if !ni.AlternatorEnabled() {
 		return 0, nil
 	}
@@ -303,18 +309,25 @@ func (s *Service) pingAlternator(ctx context.Context, _ uuid.UUID, host string, 
 		Timeout:                timeout,
 		RequiresAuthentication: ni.AlternatorEnforceAuthorization,
 	}
-
-	pingFunc := dynamoping.SimplePing
-	if !config.RequiresAuthentication {
-		pingFunc = dynamoping.QueryPing
+	tlsConfig := ni.AlternatorTLSConfig()
+	if config.RequiresAuthentication && tlsConfig == nil {
+		return 0, errors.New("Alternator authentication requires verified TLS; refusing to transmit credentials over plaintext")
+	}
+	if config.RequiresAuthentication {
+		creds := &secrets.AlternatorCreds{ClusterID: clusterID}
+		if err := s.secretsStore.Get(creds); err != nil {
+			return 0, errors.Wrap(err, "load Alternator credentials")
+		}
+		config.Credentials = aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: creds.AccessKeyID, SecretAccessKey: creds.SecretAccessKey}, nil
+		})
 	}
 
-	tlsConfig := ni.AlternatorTLSConfig()
 	if tlsConfig != nil {
 		config.TLSConfig = tlsConfig.Clone()
 	}
 
-	return pingFunc(ctx, config)
+	return dynamoping.QueryPing(ctx, config)
 }
 
 func (s *Service) decorateNodeStatus(status *NodeStatus, ni configcache.NodeConfig) {
@@ -326,9 +339,17 @@ func (s *Service) decorateNodeStatus(status *NodeStatus, ni configcache.NodeConf
 }
 
 func (s *Service) pingCQL(ctx context.Context, clusterID uuid.UUID, host string, timeout time.Duration, ni configcache.NodeConfig) (rtt time.Duration, err error) {
+	rtt, _, err = s.pingCQLVerified(ctx, clusterID, host, timeout, ni)
+	return rtt, err
+}
+
+func (s *Service) pingCQLVerified(ctx context.Context, clusterID uuid.UUID, host string, timeout time.Duration, ni configcache.NodeConfig) (rtt time.Duration, authVerified bool, err error) {
+	if ni.NodeInfo == nil {
+		return 0, false, errors.New("CQL node configuration is unavailable")
+	}
 	cluster, err := s.clusterProvider(ctx, clusterID)
 	if err != nil {
-		return rtt, errors.Wrap(err, "cluster provider")
+		return 0, false, errors.Wrap(err, "cluster provider")
 	}
 	// Try to connect directly to host address.
 	config := cqlping.Config{
@@ -337,22 +358,39 @@ func (s *Service) pingCQL(ctx context.Context, clusterID uuid.UUID, host string,
 	}
 
 	tlsConfig := ni.CQLTLSConfig()
+	if (ni.CqlPasswordProtected || ni.ClientEncryptionRequireAuth) && tlsConfig == nil {
+		return 0, false, errors.New("CQL authentication requires verified TLS; refusing to transmit credentials over plaintext")
+	}
 	if tlsConfig != nil {
 		config.Addr = tlsConfig.Address
 		config.TLSConfig = tlsConfig.Clone()
 	}
-
-	if c := s.cqlCreds(ctx, clusterID); c != nil {
-		rtt, err = cqlping.QueryPing(ctx, config, c.Username, c.Password)
-	} else {
-		logger := s.logger.With(
-			"cluster_id", clusterID,
-			"host", host,
-		)
+	if tlsConfig == nil {
+		logger := s.logger.With("cluster_id", clusterID, "host", host)
 		rtt, err = cqlping.NativeCQLPing(ctx, config, logger)
+		return rtt, false, err
 	}
 
-	return rtt, err
+	credentials := &secrets.CQLCreds{ClusterID: clusterID}
+	credentialsErr := s.secretsStore.Get(credentials)
+	if ni.CqlPasswordProtected && credentialsErr != nil {
+		return 0, false, errors.Wrap(credentialsErr, "load required CQL credentials")
+	}
+	if credentialsErr == nil {
+		rtt, err = cqlping.QueryPing(ctx, config, credentials.Username, credentials.Password)
+		return rtt, cqlAuthenticationVerified(ni, tlsConfig != nil, err), err
+	}
+	if !errors.Is(credentialsErr, util.ErrNotFound) {
+		return 0, false, errors.Wrap(credentialsErr, "load CQL credentials")
+	}
+	logger := s.logger.With("cluster_id", clusterID, "host", host)
+	rtt, err = cqlping.NativeCQLPing(ctx, config, logger)
+
+	return rtt, cqlAuthenticationVerified(ni, tlsConfig != nil, err), err
+}
+
+func cqlAuthenticationVerified(ni configcache.NodeConfig, tlsVerified bool, err error) bool {
+	return err == nil && tlsVerified && (ni.CqlPasswordProtected || ni.ClientEncryptionRequireAuth)
 }
 
 func (s *Service) pingREST(ctx context.Context, clusterID uuid.UUID, host string, timeout time.Duration, _ configcache.NodeConfig) (time.Duration, error) {
@@ -365,24 +403,17 @@ func (s *Service) pingREST(ctx context.Context, clusterID uuid.UUID, host string
 }
 
 func (s *Service) pingAgent(ctx context.Context, clusterID uuid.UUID, host string, timeout time.Duration) (time.Duration, error) {
+	c, err := s.clusterProvider(ctx, clusterID)
+	if err != nil {
+		return 0, errors.Wrap(err, "cluster provider")
+	}
+	if c.AuthToken == "" {
+		return 0, errors.New("Agent authentication is not configured")
+	}
 	client, err := s.scyllaClient(ctx, clusterID)
 	if err != nil {
 		return 0, errors.Wrapf(err, "get client for cluster with id %s", clusterID)
 	}
 
 	return client.PingAgent(ctx, host, timeout)
-}
-
-func (s *Service) cqlCreds(ctx context.Context, clusterID uuid.UUID) *secrets.CQLCreds {
-	cqlCreds := &secrets.CQLCreds{
-		ClusterID: clusterID,
-	}
-	err := s.secretsStore.Get(cqlCreds)
-	if err != nil {
-		cqlCreds = nil
-		if !errors.Is(err, util.ErrNotFound) {
-			s.logger.Error(ctx, "Failed to load CQL credentials from secrets store", "cluster_id", clusterID, "error", err)
-		}
-	}
-	return cqlCreds
 }

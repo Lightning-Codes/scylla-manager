@@ -21,8 +21,9 @@ http: 127.0.0.1:5080
 #tls_cert_file:
 #tls_key_file:
 #
-# CA to validate client certificates, if set client must present a certificate
-# signed by the CA.
+# CA to validate client certificates. When set, HTTPS, tls_cert_file, and
+# tls_key_file are required and the plaintext HTTP listener must be disabled.
+# Every API client must present a certificate signed by this CA.
 #tls_ca_file:
 
 # Bind prometheus API to the specified TCP address using HTTP protocol.
@@ -67,6 +68,10 @@ http: 127.0.0.1:5080
 # Database credentials.
 #  user: user
 #  password: password
+# Or read both values from mode 0400/0600 regular files. File-backed and inline
+# values are mutually exclusive; user_file and password_file must be set together.
+#  user_file: /run/secrets/scylla-manager-db/username
+#  password_file: /run/secrets/scylla-manager-db/password
 #
 # Local datacenter name, specify if using a remote, multi-dc cluster.
 #  local_dc:

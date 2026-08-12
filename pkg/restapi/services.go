@@ -41,7 +41,10 @@ type ClusterService interface {
 	DeleteCQLCredentials(ctx context.Context, id uuid.UUID) error
 	CheckAlternatorCredentials(id uuid.UUID) (bool, error)
 	DeleteAlternatorCredentials(ctx context.Context, id uuid.UUID) error
+	CheckSSLUserCert(id uuid.UUID) (bool, error)
 	DeleteSSLUserCert(ctx context.Context, id uuid.UUID) error
+	CheckTLSTrust(id uuid.UUID, protocol string) (bool, error)
+	DeleteTLSTrust(ctx context.Context, id uuid.UUID, protocol string) error
 	ListNodes(ctx context.Context, id uuid.UUID) ([]cluster.Node, error)
 }
 

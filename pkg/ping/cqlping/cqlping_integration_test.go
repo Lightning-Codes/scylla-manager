@@ -2,7 +2,7 @@
 
 //go:build all || integration
 
-package cqlping
+package cqlping_test
 
 import (
 	"context"
@@ -14,6 +14,7 @@ import (
 
 	"github.com/scylladb/go-log"
 	"github.com/scylladb/scylla-manager/v3/pkg/ping"
+	"github.com/scylladb/scylla-manager/v3/pkg/ping/cqlping"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/testutils"
@@ -29,7 +30,7 @@ func TestPingIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	user, password := testconfig.ManagedClusterCredentials()
-	config := Config{
+	config := cqlping.Config{
 		Addr:    sessionHosts[0],
 		Timeout: 250 * time.Millisecond,
 	}
@@ -44,7 +45,7 @@ func TestPingIntegration(t *testing.T) {
 	}
 
 	t.Run("simple", func(t *testing.T) {
-		d, err := NativeCQLPing(context.Background(), config, log.NopLogger)
+		d, err := cqlping.NativeCQLPing(context.Background(), config, log.NopLogger)
 		if err != nil {
 			t.Error(err)
 		}
@@ -52,7 +53,7 @@ func TestPingIntegration(t *testing.T) {
 	})
 
 	t.Run("query", func(t *testing.T) {
-		d, err := QueryPing(context.Background(), config, user, password)
+		d, err := cqlping.QueryPing(context.Background(), config, user, password)
 		if err != nil {
 			t.Error(err)
 		}
@@ -62,7 +63,7 @@ func TestPingIntegration(t *testing.T) {
 	t.Run("query wrong user", func(t *testing.T) {
 		c := config
 
-		d, err := QueryPing(context.Background(), c, "foo", password)
+		d, err := cqlping.QueryPing(context.Background(), c, "foo", password)
 		if err != ping.ErrUnauthorised {
 			t.Error("got", err, "expected", ping.ErrUnauthorised)
 		}
@@ -74,7 +75,7 @@ func TestPingIntegration(t *testing.T) {
 func TestPingTLSIntegration(t *testing.T) {
 	t.SkipNow()
 
-	config := Config{
+	config := cqlping.Config{
 		Addr:    testconfig.ManagedClusterHost() + ":9042",
 		Timeout: 250 * time.Millisecond,
 		TLSConfig: &tls.Config{
@@ -83,7 +84,7 @@ func TestPingTLSIntegration(t *testing.T) {
 	}
 
 	t.Run("simple", func(t *testing.T) {
-		d, err := NativeCQLPing(context.Background(), config, log.NopLogger)
+		d, err := cqlping.NativeCQLPing(context.Background(), config, log.NopLogger)
 		if err != nil {
 			t.Error(err)
 		}
@@ -91,7 +92,7 @@ func TestPingTLSIntegration(t *testing.T) {
 	})
 
 	t.Run("query", func(t *testing.T) {
-		d, err := QueryPing(context.Background(), config, "", "")
+		d, err := cqlping.QueryPing(context.Background(), config, "", "")
 		if err != nil {
 			t.Error(err)
 		}
@@ -103,7 +104,7 @@ func newTestClient(t *testing.T, logger log.Logger, config *scyllaclient.Config)
 	t.Helper()
 
 	if config == nil {
-		c := scyllaclient.TestConfig(testconfig.ManagedClusterHosts(), testutils.AgentAuthToken())
+		c := testutils.ManagedClusterAgentConfig(t, testconfig.ManagedClusterHosts(), testutils.AgentAuthToken())
 		config = &c
 	}
 

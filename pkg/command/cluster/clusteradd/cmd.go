@@ -36,6 +36,12 @@ type command struct {
 	alternatorSecretAccessKey string
 	sslUserCertFile           string
 	sslUserKeyFile            string
+	cqlCAFile                 string
+	cqlServerName             string
+	alternatorCAFile          string
+	alternatorServerName      string
+	agentCAFile               string
+	agentServerName           string
 	withoutRepair             bool
 	forceTLSDisabled          bool
 	forceNonSSLSessionPort    bool
@@ -71,6 +77,12 @@ func (cmd *command) init() {
 	w.StringVar(&cmd.alternatorSecretAccessKey, "alternator-secret-access-key", "", "")
 	w.StringVar(&cmd.sslUserCertFile, "ssl-user-cert-file", "", "")
 	w.StringVar(&cmd.sslUserKeyFile, "ssl-user-key-file", "", "")
+	w.StringVar(&cmd.cqlCAFile, "cql-ca-file", "", "")
+	w.StringVar(&cmd.cqlServerName, "cql-server-name", "", "")
+	w.StringVar(&cmd.alternatorCAFile, "alternator-ca-file", "", "")
+	w.StringVar(&cmd.alternatorServerName, "alternator-server-name", "", "")
+	w.StringVar(&cmd.agentCAFile, "agent-ca-file", "", "")
+	w.StringVar(&cmd.agentServerName, "agent-server-name", "", "")
 	w.BoolVar(&cmd.withoutRepair, "without-repair", false, "")
 	w.BoolVar(&cmd.forceTLSDisabled, "force-tls-disabled", false, "")
 	w.BoolVar(&cmd.forceNonSSLSessionPort, "force-non-ssl-session-port", false, "")
@@ -127,6 +139,9 @@ func (cmd *command) run() error {
 	if cmd.sslUserKeyFile != "" && cmd.sslUserCertFile == "" {
 		return errors.New("missing flag \"ssl-user-cert-file\"")
 	}
+	if cmd.authToken == "" {
+		return errors.New("missing flag \"auth-token\"")
+	}
 
 	w := cmd.OutOrStdout()
 
@@ -142,6 +157,35 @@ func (cmd *command) run() error {
 			return err
 		}
 		c.SslUserKeyFile = b1
+	}
+
+	trustPairs := []struct {
+		caFile     string
+		serverName string
+		protocol   string
+		set        func([]byte, string)
+	}{
+		{cmd.cqlCAFile, cmd.cqlServerName, "CQL", func(ca []byte, serverName string) {
+			c.CqlCaFile, c.CqlServerName = ca, serverName
+		}},
+		{cmd.alternatorCAFile, cmd.alternatorServerName, "Alternator", func(ca []byte, serverName string) {
+			c.AlternatorCaFile, c.AlternatorServerName = ca, serverName
+		}},
+		{cmd.agentCAFile, cmd.agentServerName, "Agent", func(ca []byte, serverName string) {
+			c.AgentCaFile, c.AgentServerName = ca, serverName
+		}},
+	}
+	for _, pair := range trustPairs {
+		ca, err := readTLSTrustPair(pair.caFile, pair.serverName, pair.protocol)
+		if err != nil {
+			return err
+		}
+		if len(ca) != 0 {
+			pair.set(ca, pair.serverName)
+		}
+	}
+	if len(c.AgentCaFile) == 0 {
+		return errors.New("missing flags \"agent-ca-file\" and \"agent-server-name\"")
 	}
 
 	id, err := cmd.client.CreateCluster(cmd.Context(), c)
@@ -168,6 +212,23 @@ func (cmd *command) run() error {
 	}
 
 	return nil
+}
+
+func readTLSTrustPair(caFile, serverName, protocol string) ([]byte, error) {
+	if caFile == "" && serverName != "" {
+		return nil, errors.Errorf("missing %s CA file", protocol)
+	}
+	if caFile != "" && serverName == "" {
+		return nil, errors.Errorf("missing %s server name", protocol)
+	}
+	if caFile == "" {
+		return nil, nil
+	}
+	ca, err := fsutil.ReadFile(caFile)
+	if err != nil {
+		return nil, errors.Wrapf(err, "read %s CA file", protocol)
+	}
+	return ca, nil
 }
 
 func clusterAddedMessage(w io.Writer, id, name string) error {

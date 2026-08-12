@@ -86,7 +86,9 @@ func TestPutWithRollback(t *testing.T) {
 		if s.version() != 1 {
 			t.Fatal("Wrong version", s.version())
 		}
-		r()
+		if err := r(); err != nil {
+			t.Fatal(err)
+		}
 		if s.version() != deleted {
 			t.Fatalf("Got version %d, expected deleted", s.version())
 		}
@@ -105,7 +107,9 @@ func TestPutWithRollback(t *testing.T) {
 		if s.version() != 2 {
 			t.Fatal("Wrong version", s.version())
 		}
-		r()
+		if err := r(); err != nil {
+			t.Fatal(err)
+		}
 		if s.version() != 1 {
 			t.Fatal("Wrong version", s.version())
 		}

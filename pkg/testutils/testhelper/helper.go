@@ -197,9 +197,9 @@ func NewTestConfigCacheSvc(t *testing.T, clusterID uuid.UUID, hosts []string) co
 	}
 
 	scyllaClientProvider := func(context.Context, uuid.UUID) (*scyllaclient.Client, error) {
-		sc := scyllaclient.TestConfig(hosts, AgentAuthToken())
+		sc := ManagedClusterAgentConfig(t, hosts, AgentAuthToken())
 		sc.Timeout = time.Second
-		sc.Transport = NewHackableRoundTripper(scyllaclient.DefaultTransport())
+		sc.Transport = NewHackableRoundTripper(sc.Transport)
 		return scyllaclient.NewClient(sc, log.NewDevelopment())
 	}
 
@@ -221,8 +221,18 @@ func ValidCluster(t *testing.T, id uuid.UUID, host string) *cluster.Cluster {
 		Username:  testconfig.TestDBUsername(),
 		Password:  testconfig.TestDBPassword(),
 	}
+	ca, err := os.ReadFile(testconfig.ManagedClusterCAFile())
+	if err != nil {
+		t.Fatalf("read managed cluster CA: %v", err)
+	}
+	c.AgentCAFile = ca
+	c.AgentServerName = testconfig.ManagedClusterTLSServerName()
 
 	if testconfig.IsSSLEnabled() {
+		c.CQLCAFile = ca
+		c.CQLServerName = testconfig.ManagedClusterTLSServerName()
+		c.AlternatorCAFile = ca
+		c.AlternatorServerName = testconfig.ManagedClusterTLSServerName()
 		sslOpts := testconfig.CQLSSLOptions()
 		userKey, err := os.ReadFile(sslOpts.KeyPath)
 		if err != nil {
@@ -234,6 +244,16 @@ func ValidCluster(t *testing.T, id uuid.UUID, host string) *cluster.Cluster {
 		}
 		c.SSLUserKeyFile = userKey
 		c.SSLUserCertFile = userCrt
+
+		config := ManagedClusterAgentConfig(t, testconfig.ManagedClusterHosts(), c.AuthToken)
+		client, err := scyllaclient.NewClient(config, log.NewDevelopment())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		session := CreateManagedClusterSession(t, false, client, "", "")
+		defer session.Close()
+		c.AlternatorAccessKeyID, c.AlternatorSecretAccessKey = GetAlternatorCreds(t, session, "")
 	}
 
 	return c

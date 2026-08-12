@@ -198,9 +198,15 @@ func (s *server) makeServices(ctx context.Context) error {
 func (s *server) onClusterChange(ctx context.Context, c cluster.Change) error {
 	switch c.Type {
 	case cluster.Update:
-		go s.configCacheSvc.ForceUpdateCluster(context.Background(), c.ID)
+		if ok := s.configCacheSvc.ForceUpdateCluster(ctx, c.ID); !ok {
+			s.logger.Error(ctx, "Cluster configuration refresh failed closed", "cluster_id", c.ID)
+			return errors.Errorf("cluster %s was committed, but its verified configuration cache refresh failed closed", c.ID)
+		}
 	case cluster.Create:
-		s.configCacheSvc.ForceUpdateCluster(ctx, c.ID)
+		if ok := s.configCacheSvc.ForceUpdateCluster(ctx, c.ID); !ok {
+			s.logger.Error(ctx, "Cluster configuration refresh failed closed; automatic tasks will not be scheduled", "cluster_id", c.ID)
+			return errors.Errorf("cluster %s was committed, but its verified configuration cache refresh failed closed; automatic tasks were not scheduled", c.ID)
+		}
 		for _, t := range makeAutoHealthCheckTasks(c.ID, s.config.Healthcheck) {
 			if err := s.schedSvc.PutTask(ctx, t); err != nil {
 				return errors.Wrapf(err, "add automatically scheduled health check for cluster %s", c.ID)

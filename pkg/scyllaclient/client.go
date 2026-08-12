@@ -3,10 +3,10 @@
 package scyllaclient
 
 import (
-	"crypto/tls"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	api "github.com/go-openapi/runtime/client"
@@ -55,10 +55,6 @@ func DefaultTransport() *http.Transport {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		MaxIdleConnsPerHost:   100,
-
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
 	}
 }
 
@@ -71,6 +67,8 @@ type Client struct {
 	agentOps  agentOperations.ClientService
 	client    retryableClient
 	hostPool  hostpool.HostPool
+	transport *revocableTransport
+	closeOnce sync.Once
 
 	mu      sync.RWMutex
 	dcCache map[string]string
@@ -99,7 +97,8 @@ func NewClient(config Config, logger log.Logger) (*Client, error) {
 	transport = auth.AddToken(transport, config.AuthToken)
 	transport = fixContentType(transport)
 
-	client := &http.Client{Transport: transport}
+	revocable := newRevocableTransport(transport)
+	client := &http.Client{Transport: revocable}
 
 	scyllaRuntime := api.NewWithClient(
 		scyllaClient.DefaultHost, scyllaClient.DefaultBasePath, []string{config.Scheme}, client,
@@ -123,6 +122,7 @@ func NewClient(config Config, logger log.Logger) (*Client, error) {
 		agentOps:  agentOps,
 		hostPool:  pool,
 		client:    retryableWrapClient(client, rc, logger),
+		transport: revocable,
 		dcCache:   make(map[string]string),
 	}, nil
 }
@@ -132,14 +132,44 @@ func (c *Client) Config() Config {
 	return c.config
 }
 
-// Close closes all the idle connections.
+// ErrClientClosed is returned when an invalidated Client is used again.
+var ErrClientClosed = errors.New("scylla client is closed")
+
+type revocableTransport struct {
+	closed atomic.Bool
+	next   http.RoundTripper
+}
+
+func newRevocableTransport(next http.RoundTripper) *revocableTransport {
+	return &revocableTransport{next: next}
+}
+
+func (t *revocableTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.closed.Load() {
+		return nil, ErrClientClosed
+	}
+	return t.next.RoundTrip(req)
+}
+
+func (t *revocableTransport) Close() {
+	t.closed.Store(true)
+}
+
+// Close revokes the client for all current holders and closes idle
+// connections. Requests already in flight are allowed to complete, while any
+// request starting after Close fails before reaching the network.
 func (c *Client) Close() error {
-	if t, ok := c.config.Transport.(*http.Transport); ok {
-		t.CloseIdleConnections()
-	}
-	if c.hostPool != nil {
-		c.hostPool.Close()
-	}
+	c.closeOnce.Do(func() {
+		if c.transport != nil {
+			c.transport.Close()
+		}
+		if t, ok := c.config.Transport.(*http.Transport); ok {
+			t.CloseIdleConnections()
+		}
+		if c.hostPool != nil {
+			c.hostPool.Close()
+		}
+	})
 	return nil
 }
 

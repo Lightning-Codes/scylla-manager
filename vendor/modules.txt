@@ -489,7 +489,7 @@ github.com/scylladb/gocqlx/v2/table
 # github.com/scylladb/scylla-manager/backupspec v1.0.3-0.20250818141015-50f1d9b3b087
 ## explicit; go 1.23.2
 github.com/scylladb/scylla-manager/backupspec
-# github.com/scylladb/scylla-manager/v3/pkg/managerclient v0.0.0-20251216101300-0a07cdbca348
+# github.com/scylladb/scylla-manager/v3/pkg/managerclient v0.0.0-20251216101300-0a07cdbca348 => ./v3/pkg/managerclient
 ## explicit; go 1.25.1
 github.com/scylladb/scylla-manager/v3/pkg/managerclient
 github.com/scylladb/scylla-manager/v3/pkg/managerclient/table
@@ -526,7 +526,7 @@ github.com/scylladb/scylla-manager/v3/pkg/util/timeutc
 github.com/scylladb/scylla-manager/v3/pkg/util/uuid
 github.com/scylladb/scylla-manager/v3/pkg/util/version
 github.com/scylladb/scylla-manager/v3/pkg/util/workerpool
-# github.com/scylladb/scylla-manager/v3/swagger v0.0.0-20260108132715-a46b9332650a
+# github.com/scylladb/scylla-manager/v3/swagger v0.0.0-20260108132715-a46b9332650a => ./v3/swagger
 ## explicit; go 1.25.1
 github.com/scylladb/scylla-manager/v3/swagger/gen/agent/client
 github.com/scylladb/scylla-manager/v3/swagger/gen/agent/client/operations
@@ -880,3 +880,5 @@ gopkg.in/yaml.v2
 gopkg.in/yaml.v3
 # github.com/gocql/gocql => github.com/scylladb/gocql v1.15.3
 # github.com/rclone/rclone => github.com/scylladb/rclone v1.54.1-0.20251215153917-de3d40fca4e9
+# github.com/scylladb/scylla-manager/v3/pkg/managerclient => ./v3/pkg/managerclient
+# github.com/scylladb/scylla-manager/v3/swagger => ./v3/swagger

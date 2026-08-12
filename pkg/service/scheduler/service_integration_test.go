@@ -160,7 +160,7 @@ func newSchedTestHelper(t *testing.T, session gocqlx.Session) *schedulerTestHelp
 	ExecStmt(t, session, "TRUNCATE TABLE scheduler_task")
 	ExecStmt(t, session, "TRUNCATE TABLE scheduler_task_run")
 
-	c := scyllaclient.TestConfig(testconfig.ManagedClusterHosts(), AgentAuthToken())
+	c := ManagedClusterAgentConfig(t, testconfig.ManagedClusterHosts(), AgentAuthToken())
 	client, err := scyllaclient.NewClient(c, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)

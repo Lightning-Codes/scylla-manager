@@ -24,6 +24,8 @@ import (
 	"github.com/scylladb/gocqlx/v2"
 	"github.com/scylladb/gocqlx/v2/qb"
 	"github.com/scylladb/scylla-manager/v3/pkg/metrics"
+	"github.com/scylladb/scylla-manager/v3/pkg/ping/cqlping"
+	"github.com/scylladb/scylla-manager/v3/pkg/ping/dynamoping"
 	"github.com/scylladb/scylla-manager/v3/pkg/schema/table"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 	"github.com/scylladb/scylla-manager/v3/pkg/secrets"
@@ -42,8 +44,10 @@ type ChangeType int8
 
 // ErrNoValidKnownHost is thrown when it was not possible to connect to any of the currently known hosts of the cluster.
 var (
-	ErrNoValidKnownHost    = errors.New("unable to connect to any of cluster's known hosts")
-	ErrNoLiveHostAvailable = errors.New("no single live host available")
+	ErrNoValidKnownHost      = errors.New("unable to connect to any of cluster's known hosts")
+	ErrNoLiveHostAvailable   = errors.New("no single live host available")
+	ErrSecureConnectivity    = errors.New("secure cluster connectivity validation failed")
+	ErrDataPlaneConnectivity = errors.New("secure data-plane connectivity validation failed")
 )
 
 // ChangeType enumeration.
@@ -70,19 +74,30 @@ type Servicer interface {
 	DeleteCluster(ctx context.Context, id uuid.UUID) error
 	CheckCQLCredentials(id uuid.UUID) (bool, error)
 	DeleteCQLCredentials(ctx context.Context, id uuid.UUID) error
+	CheckAlternatorCredentials(id uuid.UUID) (bool, error)
+	DeleteAlternatorCredentials(ctx context.Context, id uuid.UUID) error
+	CheckSSLUserCert(id uuid.UUID) (bool, error)
 	DeleteSSLUserCert(ctx context.Context, id uuid.UUID) error
+	CheckTLSTrust(id uuid.UUID, protocol string) (bool, error)
+	DeleteTLSTrust(ctx context.Context, id uuid.UUID, protocol string) error
 	ListNodes(ctx context.Context, id uuid.UUID) ([]Node, error)
 }
 
 // Service manages cluster configurations.
 type Service struct {
-	session          gocqlx.Session
-	metrics          metrics.ClusterMetrics
-	secretsStore     store.Store
-	clientCache      *scyllaclient.CachedProvider
-	timeoutConfig    scyllaclient.TimeoutConfig
-	logger           log.Logger
-	onChangeListener func(ctx context.Context, c Change) error
+	// mutationMu serializes row and secret mutations so concurrent rotations
+	// cannot interleave into a bundle that neither caller preflighted. This is
+	// process-local; the secure deployment contract is one Manager writer.
+	mutationMu          sync.Mutex
+	session             gocqlx.Session
+	metrics             metrics.ClusterMetrics
+	secretsStore        store.Store
+	clientCache         *scyllaclient.CachedProvider
+	timeoutConfig       scyllaclient.TimeoutConfig
+	logger              log.Logger
+	onChangeListener    func(ctx context.Context, c Change) error
+	cqlQueryPing        func(context.Context, cqlping.Config, string, string) (time.Duration, error)
+	alternatorQueryPing func(context.Context, dynamoping.Config) (time.Duration, error)
 }
 
 func NewService(session gocqlx.Session, metrics metrics.ClusterMetrics, secretsStore store.Store, timeoutConfig scyllaclient.TimeoutConfig,
@@ -93,11 +108,13 @@ func NewService(session gocqlx.Session, metrics metrics.ClusterMetrics, secretsS
 	}
 
 	s := &Service{
-		session:       session,
-		metrics:       metrics,
-		secretsStore:  secretsStore,
-		logger:        l,
-		timeoutConfig: timeoutConfig,
+		session:             session,
+		metrics:             metrics,
+		secretsStore:        secretsStore,
+		logger:              l,
+		timeoutConfig:       timeoutConfig,
+		cqlQueryPing:        cqlping.QueryPing,
+		alternatorQueryPing: dynamoping.QueryPing,
 	}
 	s.clientCache = scyllaclient.NewCachedProvider(s.CreateClientNoCache, cacheInvalidationTimeout, l)
 
@@ -151,18 +168,52 @@ func (s *Service) CreateClientNoCache(ctx context.Context, clusterID uuid.UUID) 
 		return nil, errors.Wrap(err, "discover and set cluster hosts")
 	}
 
-	config := s.clientConfig(c)
+	config, err := s.clientConfig(c)
+	if err != nil {
+		return nil, err
+	}
 	return scyllaclient.NewClient(config, s.logger.Named("client"))
 }
 
-func (s *Service) clientConfig(c *Cluster) scyllaclient.Config {
+func (s *Service) clientConfig(c *Cluster) (scyllaclient.Config, error) {
 	config := scyllaclient.DefaultConfigWithTimeout(s.timeoutConfig)
 	if c.Port != 0 {
 		config.Port = strconv.Itoa(c.Port)
 	}
 	config.AuthToken = c.AuthToken
 	config.Hosts = c.KnownHosts
-	return config
+	transport := scyllaclient.DefaultTransport()
+	tlsConfig, err := s.clusterTLSConfig(c, secrets.AgentProtocol)
+	if err != nil {
+		return scyllaclient.Config{}, errors.Wrap(err, "strict Agent TLS trust is unavailable")
+	}
+	transport.TLSClientConfig = tlsConfig
+	config.Transport = transport
+	return config, nil
+}
+
+func (s *Service) clusterTLSConfig(c *Cluster, protocol string) (*tls.Config, error) {
+	var trust *secrets.TLSTrust
+	switch protocol {
+	case secrets.CQLProtocol:
+		trust = secrets.NewCQLTLSTrust(c.ID)
+		trust.CA = c.CQLCAFile
+		trust.ServerName = c.CQLServerName
+	case secrets.AlternatorProtocol:
+		trust = secrets.NewAlternatorTLSTrust(c.ID)
+		trust.CA = c.AlternatorCAFile
+		trust.ServerName = c.AlternatorServerName
+	case secrets.AgentProtocol:
+		trust = secrets.NewAgentTLSTrust(c.ID)
+		trust.CA = c.AgentCAFile
+		trust.ServerName = c.AgentServerName
+	default:
+		return nil, errors.Errorf("unknown TLS protocol %q", protocol)
+	}
+	if len(trust.CA) != 0 || trust.ServerName != "" {
+		return secrets.TLSConfig(trust)
+	}
+	return secrets.LoadTLSConfig(s.secretsStore, trust)
 }
 
 func (s *Service) discoverAndSetClusterHosts(ctx context.Context, c *Cluster) error {
@@ -248,12 +299,11 @@ func (s *Service) discoverClusterHosts(ctx context.Context, c *Cluster) (knownHo
 func (s *Service) discoverClusterHostUsingCoordinator(ctx context.Context, c *Cluster, apiCallTimeout time.Duration,
 	host string,
 ) (knownHosts, liveHosts []string, err error) {
-	config := scyllaclient.DefaultConfigWithTimeout(s.timeoutConfig)
-	if c.Port != 0 {
-		config.Port = strconv.Itoa(c.Port)
+	config, err := s.clientConfig(c)
+	if err != nil {
+		return nil, nil, err
 	}
 	config.Timeout = apiCallTimeout
-	config.AuthToken = c.AuthToken
 	config.Hosts = []string{host}
 
 	client, err := scyllaclient.NewClient(config, s.logger.Named("client"))
@@ -428,10 +478,13 @@ func (s *Service) GetClusterName(ctx context.Context, id uuid.UUID) (string, err
 // PutCluster upserts a cluster, cluster instance must pass Validate() checks.
 // If u.ID == uuid.Nil a new one is generated.
 func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
-	s.logger.Debug(ctx, "PutCluster", "cluster", c)
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	if c == nil {
 		return util.ErrNilPtr
 	}
+	s.logger.Debug(ctx, "PutCluster", "cluster_id", c.ID, "cluster_name", c.Name)
 
 	t, err := s.choosePutClusterChangeType(ctx, c)
 	if err != nil {
@@ -459,6 +512,23 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 	if err := c.Validate(); err != nil {
 		return err
 	}
+	if t == Create && (len(c.AgentCAFile) == 0 || c.AgentServerName == "") {
+		return util.ErrValidate(errors.New("Agent CA file and server name are required when creating a cluster"))
+	}
+	if t == Create {
+		if err := s.ensureNoStoredSecretsOnCreate(c.ID); err != nil {
+			return err
+		}
+	}
+	if c.ForceTLSDisabled {
+		configured, err := s.CheckTLSTrust(c.ID, secrets.CQLProtocol)
+		if err != nil {
+			return errors.Wrap(err, "check CQL TLS trust")
+		}
+		if configured {
+			return util.ErrValidate(errors.New("force TLS disabled conflicts with stored CQL TLS trust"))
+		}
+	}
 
 	// Check for conflicting cluster names
 	if err := s.checkClusterNameConflict(ctx, c); err != nil {
@@ -476,13 +546,15 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 	}
 
 	if shouldValidateHostsConnectivity {
-		if err := s.ValidateHostsConnectivity(ctx, c); err != nil {
+		if err := s.validateHostsConnectivity(ctx, c, t == Create); err != nil {
 			var tip string
-			switch scyllaclient.StatusCodeOf(err) {
-			case 0:
-				tip = "make sure the IP is correct and access to port 10001 is unblocked"
-			case 401:
-				tip = "make sure auth_token config option on nodes is set correctly"
+			if !errors.Is(err, ErrDataPlaneConnectivity) {
+				switch scyllaclient.StatusCodeOf(err) {
+				case 0:
+					tip = "make sure the IP is correct and access to port 10001 is unblocked"
+				case 401:
+					tip = "make sure auth_token config option on nodes is set correctly"
+				}
 			}
 			if tip != "" {
 				err = fmt.Errorf("%w - %s", err, tip)
@@ -492,12 +564,16 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 	}
 
 	// Rollback on error.
-	var rollback []func()
+	var rollback []func() error
 	defer func() {
 		if err != nil {
-			for _, r := range rollback {
+			for i := len(rollback) - 1; i >= 0; i-- {
+				r := rollback[i]
 				if r != nil {
-					r()
+					if rollbackErr := r(); rollbackErr != nil {
+						s.logger.Error(ctx, "Failed to roll back cluster secret mutation", "cluster_id", c.ID, "error", rollbackErr)
+						err = multierr.Append(err, errors.Wrap(rollbackErr, "roll back cluster secret mutation"))
+					}
 				}
 			}
 		}
@@ -539,11 +615,36 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 		rollback = append(rollback, r)
 	}
 
+	for _, trust := range clusterTLSTrustEntries(c) {
+		r, err := store.PutWithRollback(s.secretsStore, trust)
+		if err != nil {
+			return errors.Wrapf(err, "save %s TLS trust", trust.Protocol)
+		}
+		rollback = append(rollback, r)
+	}
+
 	q := table.Cluster.InsertQuery(s.session).BindStruct(c)
 
 	if err := q.ExecRelease(); err != nil {
 		return err
 	}
+	// The cluster row and its secrets now represent one committed state. A
+	// downstream cache or scheduler notification failure must not roll back only
+	// the secrets while leaving the database row behind.
+	rollback = nil
+
+	// Secrets and the cluster row are now committed. Retire cached Agent
+	// transports immediately, and let the listener invalidate/rebuild the node
+	// configuration cache before any potentially slow post-commit network work.
+	// This closes the window in which a rotated CA, token, or client identity
+	// could coexist with a usable old cached client/configuration.
+	s.clientCache.Invalidate(c.ID)
+	changeEvent := Change{
+		ID:            c.ID,
+		Type:          t,
+		WithoutRepair: c.WithoutRepair,
+	}
+	listenerErr := s.notifyChangeListener(ctx, changeEvent)
 
 	if c.AuthToken == "" {
 		s.logger.Info(ctx, "WARNING! Scylla data is exposed on hosts, "+
@@ -567,17 +668,47 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 		s.logger.Info(ctx, "Cluster added", "cluster_id", c.ID)
 	case Update:
 		s.logger.Info(ctx, "Cluster updated", "cluster_id", c.ID)
-		s.clientCache.Invalidate(c.ID)
 	}
 
 	s.metrics.SetName(c.ID, c.Name)
+	return listenerErr
+}
 
-	changeEvent := Change{
-		ID:            c.ID,
-		Type:          t,
-		WithoutRepair: c.WithoutRepair,
+func clusterTLSTrustEntries(c *Cluster) []*secrets.TLSTrust {
+	entries := make([]*secrets.TLSTrust, 0, 3)
+	appendTrust := func(trust *secrets.TLSTrust, ca []byte, serverName string) {
+		if len(ca) == 0 && serverName == "" {
+			return
+		}
+		trust.CA = ca
+		trust.ServerName = serverName
+		entries = append(entries, trust)
 	}
-	return s.notifyChangeListener(ctx, changeEvent)
+	appendTrust(secrets.NewCQLTLSTrust(c.ID), c.CQLCAFile, c.CQLServerName)
+	appendTrust(secrets.NewAlternatorTLSTrust(c.ID), c.AlternatorCAFile, c.AlternatorServerName)
+	appendTrust(secrets.NewAgentTLSTrust(c.ID), c.AgentCAFile, c.AgentServerName)
+	return entries
+}
+
+func (s *Service) ensureNoStoredSecretsOnCreate(clusterID uuid.UUID) error {
+	entries := []store.Entry{
+		&secrets.CQLCreds{ClusterID: clusterID},
+		&secrets.AlternatorCreds{ClusterID: clusterID},
+		&secrets.TLSIdentity{ClusterID: clusterID},
+		secrets.NewCQLTLSTrust(clusterID),
+		secrets.NewAlternatorTLSTrust(clusterID),
+		secrets.NewAgentTLSTrust(clusterID),
+	}
+	for _, entry := range entries {
+		configured, err := s.secretsStore.Check(entry)
+		if err != nil {
+			return errors.Wrap(err, "check for orphaned cluster secrets")
+		}
+		if configured {
+			return util.ErrValidate(errors.New("the requested cluster ID has orphaned secrets; clean them up or use a fresh ID"))
+		}
+	}
+	return nil
 }
 
 // choosePutClusterChangeType distinguishes between cluster creation and update.
@@ -628,19 +759,31 @@ func (s *Service) checkClusterNameConflict(ctx context.Context, c *Cluster) erro
 // It doesn't need to be done when cluster params influencing connectivity over cql to scylla nodes have been updated,
 // as cql connectivity is not required for all tasks.
 func shouldValidateHostsConnectivityOnUpdate(c, old *Cluster) bool {
-	return old.Host != c.Host || old.Port != c.Port || old.AuthToken != c.AuthToken
+	return old.Host != c.Host || old.Port != c.Port || old.AuthToken != c.AuthToken ||
+		old.ForceTLSDisabled != c.ForceTLSDisabled ||
+		old.ForceNonSSLSessionPort != c.ForceNonSSLSessionPort ||
+		len(c.AgentCAFile) != 0 || c.AgentServerName != "" ||
+		len(c.CQLCAFile) != 0 || c.CQLServerName != "" ||
+		len(c.AlternatorCAFile) != 0 || c.AlternatorServerName != "" ||
+		len(c.SSLUserCertFile) != 0 || len(c.SSLUserKeyFile) != 0 ||
+		c.Username != "" || c.Password != "" ||
+		c.AlternatorAccessKeyID != "" || c.AlternatorSecretAccessKey != ""
 }
 
 // ValidateHostsConnectivity validates that scylla manager agent API is available and responding on all live hosts.
 // Hosts are discovered using cluster.host + cluster.knownHosts saved to the manager's database.
 func (s *Service) ValidateHostsConnectivity(ctx context.Context, c *Cluster) error {
+	return s.validateHostsConnectivity(ctx, c, false)
+}
+
+func (s *Service) validateHostsConnectivity(ctx context.Context, c *Cluster, requireInlineSecrets bool) error {
 	if err := s.loadKnownHosts(c); err != nil && !errors.Is(err, gocql.ErrNotFound) {
 		return errors.Wrap(err, "load known hosts")
 	}
 
 	knownHosts, liveHosts, err := s.discoverClusterHosts(ctx, c)
 	if err != nil {
-		return errors.Wrap(err, "discover cluster hosts")
+		return util.ErrValidate(errors.Wrap(multierr.Append(ErrSecureConnectivity, err), "discover cluster hosts"))
 	}
 	c.KnownHosts = knownHosts
 
@@ -648,7 +791,10 @@ func (s *Service) ValidateHostsConnectivity(ctx context.Context, c *Cluster) err
 		return util.ErrValidate(errors.New("no live nodes"))
 	}
 
-	config := s.clientConfig(c)
+	config, err := s.clientConfig(c)
+	if err != nil {
+		return err
+	}
 	config.Hosts = liveHosts
 	client, err := scyllaclient.NewClient(config, s.logger.Named("client"))
 	if err != nil {
@@ -661,13 +807,159 @@ func (s *Service) ValidateHostsConnectivity(ctx context.Context, c *Cluster) err
 		errs = multierr.Append(errs, errors.Wrap(err, liveHosts[i]))
 	}
 	if errs != nil {
-		return util.ErrValidate(errors.Wrap(errs, "connectivity check"))
+		return util.ErrValidate(errors.Wrap(multierr.Append(ErrSecureConnectivity, errs), "secure Agent connectivity check"))
+	}
+
+	// NodeInfo is a protected Agent endpoint. Use it to discover the security
+	// requirements of every live data-plane endpoint, then prove the pending
+	// (or already stored) trust and credentials before committing a cluster
+	// create or rotation. This prevents a bad CQL/Alternator CA from being
+	// persisted merely because the Agent itself was reachable.
+	dataPlaneErrs := make([]error, len(liveHosts))
+	var wg sync.WaitGroup
+	wg.Add(len(liveHosts))
+	for i, host := range liveHosts {
+		go func(i int, host string) {
+			defer wg.Done()
+			ni, err := client.NodeInfo(ctx, host)
+			if err == nil {
+				err = s.validateNodeDataPlaneConnectivity(ctx, c, host, ni, requireInlineSecrets)
+			}
+			dataPlaneErrs[i] = errors.Wrap(err, host)
+		}(i, host)
+	}
+	wg.Wait()
+	if errs := multierr.Combine(dataPlaneErrs...); errs != nil {
+		return util.ErrValidate(errors.Wrap(multierr.Combine(ErrSecureConnectivity, ErrDataPlaneConnectivity, errs), "secure data-plane connectivity check"))
 	}
 	return nil
 }
 
+func (s *Service) validateNodeDataPlaneConnectivity(ctx context.Context, c *Cluster, host string, ni *scyllaclient.NodeInfo, requireInlineSecrets bool) error {
+	if ni == nil {
+		return errors.New("node info is unavailable")
+	}
+	if err := s.validateCQLConnectivity(ctx, c, host, ni, requireInlineSecrets); err != nil {
+		return errors.Wrap(err, "CQL")
+	}
+	if err := s.validateAlternatorConnectivity(ctx, c, host, ni, requireInlineSecrets); err != nil {
+		return errors.Wrap(err, "Alternator")
+	}
+	return nil
+}
+
+func (s *Service) validateCQLConnectivity(ctx context.Context, c *Cluster, host string, ni *scyllaclient.NodeInfo, requireInlineSecrets bool) error {
+	if !ni.ClientEncryptionEnabled {
+		if ni.CqlPasswordProtected || ni.ClientEncryptionRequireAuth {
+			return errors.New("authentication is required without TLS; refusing an unauthenticated or plaintext CQL connection")
+		}
+		return nil
+	}
+	if c.ForceTLSDisabled {
+		return errors.New("TLS is advertised but force TLS disabled is set")
+	}
+	if requireInlineSecrets && (len(c.CQLCAFile) == 0 || c.CQLServerName == "") {
+		return errors.New("TLS is enabled, but CQL CA file and server name were not supplied for cluster creation")
+	}
+
+	tlsConfig, err := s.clusterTLSConfig(c, secrets.CQLProtocol)
+	if err != nil {
+		return errors.Wrap(err, "TLS is enabled, but strict trust is unavailable")
+	}
+	if ni.ClientEncryptionRequireAuth {
+		if requireInlineSecrets && (len(c.SSLUserCertFile) == 0 || len(c.SSLUserKeyFile) == 0) {
+			return errors.New("client certificate authentication is enabled, but a client certificate and key were not supplied for cluster creation")
+		}
+		identity, err := s.tlsIdentityForCluster(c)
+		if err != nil {
+			return errors.Wrap(err, "load required client identity")
+		}
+		tlsConfig.Certificates = []tls.Certificate{identity}
+	}
+
+	config := cqlping.Config{
+		Addr:      ni.CQLAddr(host, c.ForceNonSSLSessionPort),
+		Timeout:   s.timeoutConfig.Timeout,
+		TLSConfig: tlsConfig,
+	}
+	var username, password string
+	credentialsSet := c.Username != "" || c.Password != ""
+	if !requireInlineSecrets || credentialsSet {
+		username, password, credentialsSet, err = s.cqlCredentialsForCluster(c)
+		if err != nil {
+			return errors.Wrap(err, "load credentials")
+		}
+	}
+	if ni.CqlPasswordProtected && !credentialsSet {
+		if requireInlineSecrets {
+			return errors.Wrap(ErrNoCQLCredentials, "credentials were not supplied for cluster creation")
+		}
+		return ErrNoCQLCredentials
+	}
+	if credentialsSet {
+		_, err = s.runCQLQueryPing(ctx, config, username, password)
+	} else {
+		_, err = cqlping.NativeCQLPing(ctx, config, s.logger.With("cluster_id", c.ID, "host", host))
+	}
+	return errors.Wrap(err, "verified query")
+}
+
+func (s *Service) validateAlternatorConnectivity(ctx context.Context, c *Cluster, host string, ni *scyllaclient.NodeInfo, requireInlineSecrets bool) error {
+	if !ni.AlternatorEnabled() {
+		return nil
+	}
+	if !ni.AlternatorEncryptionEnabled() {
+		if ni.AlternatorEnforceAuthorization {
+			return errors.New("authentication is enabled without TLS; refusing to transmit Alternator credentials over plaintext")
+		}
+		return nil
+	}
+	if requireInlineSecrets && (len(c.AlternatorCAFile) == 0 || c.AlternatorServerName == "") {
+		return errors.New("TLS is enabled, but Alternator CA file and server name were not supplied for cluster creation")
+	}
+
+	tlsConfig, err := s.clusterTLSConfig(c, secrets.AlternatorProtocol)
+	if err != nil {
+		return errors.Wrap(err, "TLS is enabled, but strict trust is unavailable")
+	}
+	config := dynamoping.Config{
+		Addr:                   ni.AlternatorAddr(host),
+		RequiresAuthentication: ni.AlternatorEnforceAuthorization,
+		Timeout:                s.timeoutConfig.Timeout,
+		TLSConfig:              tlsConfig,
+	}
+	if ni.AlternatorEnforceAuthorization {
+		if requireInlineSecrets && (c.AlternatorAccessKeyID == "" || c.AlternatorSecretAccessKey == "") {
+			return errors.Wrap(ErrNoAlternatorCredentials, "credentials were not supplied for cluster creation")
+		}
+		config.Credentials, err = s.alternatorCredentialsForCluster(c)
+		if err != nil {
+			return errors.Wrap(err, "load required credentials")
+		}
+	}
+	_, err = s.runAlternatorQueryPing(ctx, config)
+	return errors.Wrap(err, "verified query")
+}
+
+func (s *Service) runCQLQueryPing(ctx context.Context, config cqlping.Config, username, password string) (time.Duration, error) {
+	if s.cqlQueryPing != nil {
+		return s.cqlQueryPing(ctx, config, username, password)
+	}
+	return cqlping.QueryPing(ctx, config, username, password)
+}
+
+func (s *Service) runAlternatorQueryPing(ctx context.Context, config dynamoping.Config) (time.Duration, error) {
+	if s.alternatorQueryPing != nil {
+		return s.alternatorQueryPing(ctx, config)
+	}
+	return dynamoping.QueryPing(ctx, config)
+}
+
 // DeleteCluster removes cluster and it's secrets.
 func (s *Service) DeleteCluster(ctx context.Context, clusterID uuid.UUID) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	s.logger.Debug(ctx, "DeleteCluster", "cluster_id", clusterID)
 
 	q := table.Cluster.DeleteQuery(s.session).BindMap(qb.M{
@@ -678,17 +970,20 @@ func (s *Service) DeleteCluster(ctx context.Context, clusterID uuid.UUID) error 
 		return err
 	}
 
-	if err := s.secretsStore.DeleteAll(clusterID); err != nil {
+	// The row is gone, so retire all cached authenticated transports and node
+	// configuration before attempting best-effort secret cleanup. A secrets
+	// table failure must not leave a deleted cluster's old bearer token and
+	// pinned trust usable by scheduled work.
+	s.clientCache.Invalidate(clusterID)
+	listenerErr := s.notifyChangeListener(ctx, Change{ID: clusterID, Type: Delete})
+	secretsErr := s.secretsStore.DeleteAll(clusterID)
+	if secretsErr != nil {
 		s.logger.Error(ctx, "Failed to delete cluster secrets",
 			"cluster_id", clusterID,
-			"error", err,
+			"error", secretsErr,
 		)
-		return errors.Wrap(err, "delete cluster secrets")
 	}
-
-	s.clientCache.Invalidate(clusterID)
-
-	return s.notifyChangeListener(ctx, Change{ID: clusterID, Type: Delete})
+	return errors.Wrap(multierr.Combine(listenerErr, secretsErr), "delete cluster cleanup")
 }
 
 // CheckCQLCredentials checks if associated CQLCreds exist in secrets store.
@@ -701,6 +996,8 @@ func (s *Service) CheckCQLCredentials(id uuid.UUID) (bool, error) {
 
 // DeleteCQLCredentials removes the associated CQLCreds from secrets store.
 func (s *Service) DeleteCQLCredentials(_ context.Context, clusterID uuid.UUID) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	return s.secretsStore.Delete(&secrets.CQLCreds{
 		ClusterID: clusterID,
 	})
@@ -716,16 +1013,69 @@ func (s *Service) CheckAlternatorCredentials(id uuid.UUID) (bool, error) {
 
 // DeleteAlternatorCredentials removes the associated AlternatorCreds from secrets store.
 func (s *Service) DeleteAlternatorCredentials(_ context.Context, clusterID uuid.UUID) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	return s.secretsStore.Delete(&secrets.AlternatorCreds{
 		ClusterID: clusterID,
 	})
 }
 
 // DeleteSSLUserCert removes the associated TLSIdentity from secrets store.
-func (s *Service) DeleteSSLUserCert(_ context.Context, clusterID uuid.UUID) error {
-	return s.secretsStore.Delete(&secrets.TLSIdentity{
+func (s *Service) DeleteSSLUserCert(ctx context.Context, clusterID uuid.UUID) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if err := s.secretsStore.Delete(&secrets.TLSIdentity{
 		ClusterID: clusterID,
-	})
+	}); err != nil {
+		return err
+	}
+	s.clientCache.Invalidate(clusterID)
+	return s.notifyChangeListener(ctx, Change{ID: clusterID, Type: Update})
+}
+
+// CheckSSLUserCert checks if an associated TLS client identity exists.
+func (s *Service) CheckSSLUserCert(id uuid.UUID) (bool, error) {
+	return s.secretsStore.Check(&secrets.TLSIdentity{ClusterID: id})
+}
+
+// CheckTLSTrust checks if protocol-specific strict TLS trust exists.
+func (s *Service) CheckTLSTrust(id uuid.UUID, protocol string) (bool, error) {
+	trust, err := tlsTrustEntry(id, protocol)
+	if err != nil {
+		return false, err
+	}
+	return s.secretsStore.Check(trust)
+}
+
+// DeleteTLSTrust removes protocol-specific strict TLS trust.
+func (s *Service) DeleteTLSTrust(ctx context.Context, id uuid.UUID, protocol string) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if protocol == secrets.AgentProtocol {
+		return util.ErrValidate(errors.New("Agent TLS trust is mandatory; rotate it through PUT or delete the cluster"))
+	}
+	trust, err := tlsTrustEntry(id, protocol)
+	if err != nil {
+		return err
+	}
+	if err := s.secretsStore.Delete(trust); err != nil {
+		return err
+	}
+	s.clientCache.Invalidate(id)
+	return s.notifyChangeListener(ctx, Change{ID: id, Type: Update})
+}
+
+func tlsTrustEntry(id uuid.UUID, protocol string) (*secrets.TLSTrust, error) {
+	switch protocol {
+	case secrets.CQLProtocol:
+		return secrets.NewCQLTLSTrust(id), nil
+	case secrets.AlternatorProtocol:
+		return secrets.NewAlternatorTLSTrust(id), nil
+	case secrets.AgentProtocol:
+		return secrets.NewAgentTLSTrust(id), nil
+	default:
+		return nil, util.ErrValidate(errors.Errorf("unsupported TLS protocol %q", protocol))
+	}
 }
 
 // ListNodes returns information about all the nodes in the cluster.
@@ -843,10 +1193,10 @@ func (s *Service) GetSession(ctx context.Context, clusterID uuid.UUID, opts ...S
 	if err != nil {
 		return session, errors.Wrap(err, "fetch node info")
 	}
-	if err := s.extendClusterConfigWithAuthentication(clusterID, ni, cfg); err != nil {
+	if err := s.extendClusterConfigWithTLS(clusterInfo, ni, cfg); err != nil {
 		return session, err
 	}
-	if err := s.extendClusterConfigWithTLS(clusterInfo, ni, cfg); err != nil {
+	if err := s.extendClusterConfigWithAuthentication(clusterInfo, ni, cfg); err != nil {
 		return session, err
 	}
 
@@ -858,33 +1208,56 @@ func (s *Service) GetSession(ctx context.Context, clusterID uuid.UUID, opts ...S
 var ErrNoCQLCredentials = errors.New("cluster requires CQL authentication but username/password was not set. " +
 	"Use 'sctool cluster update --username --password' for adding them")
 
-func (s *Service) extendClusterConfigWithAuthentication(clusterID uuid.UUID, ni *scyllaclient.NodeInfo, cfg *gocql.ClusterConfig) error {
+func (s *Service) extendClusterConfigWithAuthentication(clusterInfo *Cluster, ni *scyllaclient.NodeInfo, cfg *gocql.ClusterConfig) error {
+	if ni.ClientEncryptionRequireAuth && cfg.SslOpts == nil {
+		return errors.New("CQL client-certificate authentication requires verified TLS")
+	}
 	if ni.CqlPasswordProtected {
-		credentials := secrets.CQLCreds{
-			ClusterID: clusterID,
+		if !ni.ClientEncryptionEnabled || clusterInfo.ForceTLSDisabled || cfg.SslOpts == nil {
+			return errors.New("CQL password authentication requires verified TLS; refusing to transmit credentials over plaintext")
 		}
-		err := s.secretsStore.Get(&credentials)
-		if errors.Is(err, util.ErrNotFound) {
-			return ErrNoCQLCredentials
-		}
+		username, password, configured, err := s.cqlCredentialsForCluster(clusterInfo)
 		if err != nil {
 			return errors.Wrap(err, "get credentials")
 		}
+		if !configured {
+			return ErrNoCQLCredentials
+		}
 
 		cfg.Authenticator = gocql.PasswordAuthenticator{
-			Username: credentials.Username,
-			Password: credentials.Password,
+			Username: username,
+			Password: password,
 		}
 	}
 	return nil
 }
 
+func (s *Service) cqlCredentialsForCluster(c *Cluster) (username, password string, configured bool, err error) {
+	if c.Username != "" || c.Password != "" {
+		if c.Username == "" || c.Password == "" {
+			return "", "", false, util.ErrValidate(errors.New("incomplete CQL credentials"))
+		}
+		return c.Username, c.Password, true, nil
+	}
+	credentials := &secrets.CQLCreds{ClusterID: c.ID}
+	if err := s.secretsStore.Get(credentials); err != nil {
+		if errors.Is(err, util.ErrNotFound) {
+			return "", "", false, nil
+		}
+		return "", "", false, err
+	}
+	return credentials.Username, credentials.Password, true, nil
+}
+
 func (s *Service) extendClusterConfigWithTLS(cluster *Cluster, ni *scyllaclient.NodeInfo, cfg *gocql.ClusterConfig) error {
 	if ni.ClientEncryptionEnabled && !cluster.ForceTLSDisabled {
+		tlsConfig, err := s.clusterTLSConfig(cluster, secrets.CQLProtocol)
+		if err != nil {
+			return errors.Wrap(err, "CQL TLS is enabled, but strict CQL trust is unavailable")
+		}
 		cfg.SslOpts = &gocql.SslOptions{
-			Config: &tls.Config{
-				InsecureSkipVerify: true,
-			},
+			Config:                 tlsConfig,
+			EnableHostVerification: true,
 		}
 		if ni.ClientEncryptionRequireAuth {
 			keyPair, err := s.loadTLSIdentity(cluster.ID)
@@ -924,15 +1297,24 @@ func (s *Service) GetAlternatorClient(ctx context.Context, clusterID uuid.UUID, 
 // alternatorClientConfig return aws.Config used for creating *dynamodb.DynamoDB for communicating with alternator API.
 // It uses cluster scyllaclient.Config for configuring timeout and retry mechanisms.
 func (s *Service) alternatorClientConfig(ctx context.Context, clusterID uuid.UUID, host string, ni *scyllaclient.NodeInfo) (aws.Config, error) {
+	if ni.AlternatorEnforceAuthorization && !ni.AlternatorEncryptionEnabled() {
+		return aws.Config{}, errors.New("Alternator authentication requires verified TLS; refusing to transmit credentials over plaintext")
+	}
 	cluster, err := s.GetClusterByID(ctx, clusterID)
 	if err != nil {
 		return aws.Config{}, errors.Wrap(err, "get cluster")
 	}
-	scCfg := s.clientConfig(cluster)
+	scCfg, err := s.clientConfig(cluster)
+	if err != nil {
+		return aws.Config{}, err
+	}
 
 	transport := alternatorTransport()
 	if ni.AlternatorEncryptionEnabled() {
-		transport.TLSClientConfig = alternatorTLSConfig()
+		transport.TLSClientConfig, err = s.clusterTLSConfig(cluster, secrets.AlternatorProtocol)
+		if err != nil {
+			return aws.Config{}, errors.Wrap(err, "Alternator TLS is enabled, but strict Alternator trust is unavailable")
+		}
 	}
 
 	cfg := aws.Config{
@@ -974,25 +1356,29 @@ func alternatorTransport() *http.Transport {
 	}
 }
 
-func alternatorTLSConfig() *tls.Config {
-	return &tls.Config{
-		// Right now Alternator does not support client TLS cert authentication, so we don't need to set them
-		InsecureSkipVerify: true,
-	}
-}
-
 // ErrNoAlternatorCredentials is returned when cluster alternator credentials are required, but credentials weren't added.
 var ErrNoAlternatorCredentials = errors.New("cluster requires alternator authentication but they aren't set. " +
 	"Use 'sctool cluster update --alternator-access-key-id --alternator-secret-access-key' for adding them")
 
 func (s *Service) alternatorCredentials(clusterID uuid.UUID) (aws.CredentialsProvider, error) {
-	c := secrets.AlternatorCreds{ClusterID: clusterID}
-	err := s.secretsStore.Get(&c)
-	if errors.Is(err, util.ErrNotFound) {
-		return nil, ErrNoAlternatorCredentials
+	return s.alternatorCredentialsForCluster(&Cluster{ID: clusterID})
+}
+
+func (s *Service) alternatorCredentialsForCluster(cluster *Cluster) (aws.CredentialsProvider, error) {
+	c := &secrets.AlternatorCreds{
+		ClusterID:       cluster.ID,
+		AccessKeyID:     cluster.AlternatorAccessKeyID,
+		SecretAccessKey: cluster.AlternatorSecretAccessKey,
 	}
-	if err != nil {
-		return nil, errors.Wrap(err, "get credentials from secrets store")
+	if c.AccessKeyID == "" && c.SecretAccessKey == "" {
+		if err := s.secretsStore.Get(c); err != nil {
+			if errors.Is(err, util.ErrNotFound) {
+				return nil, ErrNoAlternatorCredentials
+			}
+			return nil, errors.Wrap(err, "get credentials from secrets store")
+		}
+	} else if c.AccessKeyID == "" || c.SecretAccessKey == "" {
+		return nil, util.ErrValidate(errors.New("incomplete Alternator credentials"))
 	}
 	return aws.CredentialsProviderFunc(func(_ context.Context) (aws.Credentials, error) {
 		return aws.Credentials{
@@ -1008,15 +1394,24 @@ var ErrNoTLSIdentity = errors.New("cluster requires encryption authentication bu
 	"Use 'sctool cluster update --ssl-user-key-file --ssl-user-cert-file' for adding them")
 
 func (s *Service) loadTLSIdentity(clusterID uuid.UUID) (tls.Certificate, error) {
-	tlsIdentity := secrets.TLSIdentity{
-		ClusterID: clusterID,
+	return s.tlsIdentityForCluster(&Cluster{ID: clusterID})
+}
+
+func (s *Service) tlsIdentityForCluster(cluster *Cluster) (tls.Certificate, error) {
+	tlsIdentity := &secrets.TLSIdentity{
+		ClusterID:  cluster.ID,
+		Cert:       cluster.SSLUserCertFile,
+		PrivateKey: cluster.SSLUserKeyFile,
 	}
-	err := s.secretsStore.Get(&tlsIdentity)
-	if errors.Is(err, util.ErrNotFound) {
-		return tls.Certificate{}, ErrNoTLSIdentity
-	}
-	if err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "get TLS/SSL identity")
+	if len(tlsIdentity.Cert) == 0 && len(tlsIdentity.PrivateKey) == 0 {
+		if err := s.secretsStore.Get(tlsIdentity); err != nil {
+			if errors.Is(err, util.ErrNotFound) {
+				return tls.Certificate{}, ErrNoTLSIdentity
+			}
+			return tls.Certificate{}, errors.Wrap(err, "get TLS/SSL identity")
+		}
+	} else if len(tlsIdentity.Cert) == 0 || len(tlsIdentity.PrivateKey) == 0 {
+		return tls.Certificate{}, util.ErrValidate(errors.New("incomplete TLS/SSL identity"))
 	}
 
 	keyPair, err := tls.X509KeyPair(tlsIdentity.Cert, tlsIdentity.PrivateKey)

@@ -129,7 +129,7 @@ func newTestClient(t *testing.T, hrt *HackableRoundTripper, logger log.Logger, c
 	t.Helper()
 
 	if config == nil {
-		c := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
+		c := ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken())
 		config = &c
 	}
 	config.Transport = hrt
@@ -1164,7 +1164,7 @@ func TestBackupResumeIntegration(t *testing.T) {
 	})
 
 	t.Run("resume after agent restart", func(t *testing.T) {
-		clientConf := scyllaclient.TestConfig(h.GetAllHosts(), AgentAuthToken())
+		clientConf := ManagedClusterAgentConfig(t, h.GetAllHosts(), AgentAuthToken())
 		clientConf.Backoff.MaxRetries = 5
 
 		var (

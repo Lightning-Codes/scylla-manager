@@ -132,3 +132,31 @@ func TestParseConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateRequiresPersistentTLSCertificate(t *testing.T) {
+	base := agent.DefaultConfig()
+	base.TLSCertFile = "agent.crt"
+	base.TLSKeyFile = "agent.key"
+
+	for _, tc := range []struct {
+		name    string
+		cert    string
+		key     string
+		wantErr bool
+	}{
+		{name: "both configured", cert: "agent.crt", key: "agent.key"},
+		{name: "both missing", wantErr: true},
+		{name: "certificate missing", key: "agent.key", wantErr: true},
+		{name: "key missing", cert: "agent.crt", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base
+			c.TLSCertFile = tc.cert
+			c.TLSKeyFile = tc.key
+			err := c.Validate()
+			if gotErr := err != nil; gotErr != tc.wantErr {
+				t.Fatalf("Validate() error = %v, want error %v", err, tc.wantErr)
+			}
+		})
+	}
+}

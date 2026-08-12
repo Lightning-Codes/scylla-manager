@@ -36,3 +36,9 @@ func IsErrValidate(err error) bool {
 func (e errValidate) Error() string {
 	return e.err.Error()
 }
+
+// Unwrap exposes the validation cause to errors.Is/errors.As while retaining
+// the validation marker used by the REST layer.
+func (e errValidate) Unwrap() error {
+	return e.err
+}

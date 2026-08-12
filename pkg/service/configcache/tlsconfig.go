@@ -28,8 +28,9 @@ func newCQLTLSConfigIfEnabled(c *cluster.Cluster, nodeInfo *scyllaclient.NodeInf
 		return nil, nil // nolint: nilnil
 	}
 	cqlAddress := nodeInfo.CQLAddr(host, c.ForceTLSDisabled || c.ForceNonSSLSessionPort)
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
+	tlsConfig, err := secrets.LoadTLSConfig(secretsStore, secrets.NewCQLTLSTrust(c.ID))
+	if err != nil {
+		return nil, errors.Wrap(err, "CQL TLS is enabled, but strict CQL trust is unavailable")
 	}
 	if cqlClientCertAuth {
 		cert, err := prepareCertificates(c, secretsStore)
@@ -53,8 +54,9 @@ func newAlternatorTLSConfigIfEnabled(c *cluster.Cluster, nodeInfo *scyllaclient.
 	}
 	alternatorAddress := nodeInfo.AlternatorAddr(host)
 
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
+	tlsConfig, err := secrets.LoadTLSConfig(secretsStore, secrets.NewAlternatorTLSTrust(c.ID))
+	if err != nil {
+		return nil, errors.Wrap(err, "Alternator TLS is enabled, but strict Alternator trust is unavailable")
 	}
 	if alternatorClientCertAuth {
 		cert, err := prepareCertificates(c, secretsStore)

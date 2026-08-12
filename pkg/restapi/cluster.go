@@ -4,6 +4,8 @@ package restapi
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -12,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
 	"github.com/pkg/errors"
+	"github.com/scylladb/scylla-manager/v3/pkg/secrets"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 )
 
@@ -77,27 +80,11 @@ func (h clusterHandler) listClusters(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if cluster CQL and alternator credentials are set, but don't return them
-	const setCreds = "set"
-	for _, c := range ids {
-		ok, err := h.svc.CheckCQLCredentials(c.ID)
+	for i, c := range ids {
+		ids[i], err = h.sanitizedCluster(c)
 		if err != nil {
-			respondError(w, r, errors.Wrapf(err, "cluster %s: check CQL credentials", c.ID))
+			respondError(w, r, errors.Wrapf(err, "cluster %s: sanitize response", c.ID))
 			return
-		}
-		if ok {
-			c.Username = setCreds
-			c.Password = setCreds
-		}
-
-		ok, err = h.svc.CheckAlternatorCredentials(c.ID)
-		if err != nil {
-			respondError(w, r, errors.Wrapf(err, "cluster %s: check alternator credentials", c.ID))
-			return
-		}
-		if ok {
-			c.AlternatorAccessKeyID = setCreds
-			c.AlternatorSecretAccessKey = setCreds
 		}
 	}
 
@@ -108,16 +95,24 @@ func (h clusterHandler) listClusters(w http.ResponseWriter, r *http.Request) {
 	render.Respond(w, r, ids)
 }
 
-func (h clusterHandler) parseCluster(r *http.Request) (*cluster.Cluster, error) {
-	var c cluster.Cluster
-	if err := render.DecodeJSON(r.Body, &c); err != nil {
-		return nil, err
+func (h clusterHandler) parseCluster(r *http.Request) (*cluster.Cluster, map[string]json.RawMessage, error) {
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, nil, err
 	}
-	return &c, nil
+	var c cluster.Cluster
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return nil, nil, err
+	}
+	return &c, fields, nil
 }
 
 func (h clusterHandler) createCluster(w http.ResponseWriter, r *http.Request) {
-	newCluster, err := h.parseCluster(r)
+	newCluster, _, err := h.parseCluster(r)
 	if err != nil {
 		respondBadRequest(w, r, err)
 		return
@@ -137,13 +132,18 @@ func (h clusterHandler) createCluster(w http.ResponseWriter, r *http.Request) {
 
 func (h clusterHandler) loadCluster(w http.ResponseWriter, r *http.Request) {
 	c := mustClusterFromCtx(r)
-	render.Respond(w, r, c)
+	out, err := h.sanitizedCluster(c)
+	if err != nil {
+		respondError(w, r, errors.Wrapf(err, "cluster %s: sanitize response", c.ID))
+		return
+	}
+	render.Respond(w, r, out)
 }
 
 func (h clusterHandler) updateCluster(w http.ResponseWriter, r *http.Request) {
 	c := mustClusterFromCtx(r)
 
-	newCluster, err := h.parseCluster(r)
+	newCluster, fields, err := h.parseCluster(r)
 	if err != nil {
 		respondBadRequest(w, r, err)
 		return
@@ -152,51 +152,137 @@ func (h clusterHandler) updateCluster(w http.ResponseWriter, r *http.Request) {
 	// Cluster.KnownHosts are not part of REST API definitions,
 	// so we need to fill them based on current cluster state.
 	newCluster.KnownHosts = c.KnownHosts
+	if _, present := fields["auth_token"]; !present {
+		newCluster.AuthToken = c.AuthToken
+	}
 
 	if err := h.svc.PutCluster(r.Context(), newCluster); err != nil {
 		respondError(w, r, errors.Wrapf(err, "update cluster %q", c.ID))
 		return
 	}
-	render.Respond(w, r, newCluster)
+	out, err := h.sanitizedCluster(newCluster)
+	if err != nil {
+		respondError(w, r, errors.Wrapf(err, "cluster %s: sanitize response", c.ID))
+		return
+	}
+	render.Respond(w, r, out)
+}
+
+func (h clusterHandler) sanitizedCluster(c *cluster.Cluster) (*cluster.Cluster, error) {
+	out := *c
+	out.AuthTokenSet = c.AuthToken != ""
+	out.AuthToken = ""
+	out.Username = ""
+	out.Password = ""
+	out.AlternatorAccessKeyID = ""
+	out.AlternatorSecretAccessKey = ""
+	out.SSLUserCertFile = nil
+	out.SSLUserKeyFile = nil
+	out.CQLCAFile = nil
+	out.CQLServerName = ""
+	out.AlternatorCAFile = nil
+	out.AlternatorServerName = ""
+	out.AgentCAFile = nil
+	out.AgentServerName = ""
+
+	checks := []struct {
+		name string
+		set  *bool
+		fn   func() (bool, error)
+	}{
+		{"CQL credentials", &out.CQLCredentialsSet, func() (bool, error) { return h.svc.CheckCQLCredentials(c.ID) }},
+		{"Alternator credentials", &out.AlternatorCredentialsSet, func() (bool, error) { return h.svc.CheckAlternatorCredentials(c.ID) }},
+		{"SSL user certificate", &out.SSLUserCertSet, func() (bool, error) { return h.svc.CheckSSLUserCert(c.ID) }},
+		{"CQL CA", &out.CQLCASet, func() (bool, error) { return h.svc.CheckTLSTrust(c.ID, secrets.CQLProtocol) }},
+		{"Alternator CA", &out.AlternatorCASet, func() (bool, error) { return h.svc.CheckTLSTrust(c.ID, secrets.AlternatorProtocol) }},
+		{"Agent CA", &out.AgentCASet, func() (bool, error) { return h.svc.CheckTLSTrust(c.ID, secrets.AgentProtocol) }},
+	}
+	for _, check := range checks {
+		set, err := check.fn()
+		if err != nil {
+			return nil, errors.Wrap(err, "check "+check.name)
+		}
+		*check.set = set
+	}
+	return &out, nil
 }
 
 func (h clusterHandler) deleteCluster(w http.ResponseWriter, r *http.Request) {
 	c := mustClusterFromCtx(r)
+	if r.ContentLength != 0 {
+		respondBadRequest(w, r, errors.New("cluster deletion selectors must be supplied as query parameters; request bodies are not accepted"))
+		return
+	}
+	query := r.URL.Query()
+	allowedSelectors := map[string]bool{
+		"cql_creds": true, "alternator_creds": true, "ssl_user_cert": true,
+		"cql_ca": true, "alternator_ca": true, "agent_ca": true,
+	}
+	for key := range query {
+		if !allowedSelectors[key] {
+			respondBadRequest(w, r, errors.Errorf("unknown cluster deletion selector %q", key))
+			return
+		}
+	}
+	if query.Has("agent_ca") {
+		respondBadRequest(w, r, errors.New("Agent TLS trust is mandatory; rotate it through PUT or delete the cluster"))
+		return
+	}
+	selectorPresent := len(query) != 0
 
 	var (
 		deleteCQLCredentials        bool
 		deleteAlternatorCredentials bool
 		deleteSSLUserCert           bool
+		deleteCQLCA                 bool
+		deleteAlternatorCA          bool
 		err                         error
 	)
 
-	if v := r.FormValue("cql_creds"); v != "" {
+	if v := query.Get("cql_creds"); v != "" {
 		deleteCQLCredentials, err = strconv.ParseBool(v)
 		if err != nil {
 			respondBadRequest(w, r, err)
 			return
 		}
 	}
-	if v := r.FormValue("alternator_creds"); v != "" {
+	if v := query.Get("alternator_creds"); v != "" {
 		deleteAlternatorCredentials, err = strconv.ParseBool(v)
 		if err != nil {
 			respondBadRequest(w, r, err)
 			return
 		}
 	}
-	if v := r.FormValue("ssl_user_cert"); v != "" {
+	if v := query.Get("ssl_user_cert"); v != "" {
 		deleteSSLUserCert, err = strconv.ParseBool(v)
 		if err != nil {
 			respondBadRequest(w, r, err)
 			return
 		}
 	}
+	for name, dst := range map[string]*bool{
+		"cql_ca":        &deleteCQLCA,
+		"alternator_ca": &deleteAlternatorCA,
+	} {
+		if v := query.Get(name); v != "" {
+			*dst, err = strconv.ParseBool(v)
+			if err != nil {
+				respondBadRequest(w, r, err)
+				return
+			}
+		}
+	}
 
-	if !deleteCQLCredentials && !deleteAlternatorCredentials && !deleteSSLUserCert {
+	deleteAny := deleteCQLCredentials || deleteAlternatorCredentials || deleteSSLUserCert || deleteCQLCA || deleteAlternatorCA
+	if !selectorPresent {
 		if err := h.svc.DeleteCluster(r.Context(), c.ID); err != nil {
 			respondError(w, r, errors.Wrapf(err, "delete cluster %q", c.ID))
 			return
 		}
+	}
+	if selectorPresent && !deleteAny {
+		respondBadRequest(w, r, errors.New("at least one cluster secret selector must be true"))
+		return
 	}
 	if deleteCQLCredentials {
 		if err := h.svc.DeleteCQLCredentials(r.Context(), c.ID); err != nil {
@@ -214,6 +300,17 @@ func (h clusterHandler) deleteCluster(w http.ResponseWriter, r *http.Request) {
 		if err := h.svc.DeleteSSLUserCert(r.Context(), c.ID); err != nil {
 			respondError(w, r, errors.Wrapf(err, "delete SSL user cert for cluster %q", c.ID))
 			return
+		}
+	}
+	for protocol, remove := range map[string]bool{
+		secrets.CQLProtocol:        deleteCQLCA,
+		secrets.AlternatorProtocol: deleteAlternatorCA,
+	} {
+		if remove {
+			if err := h.svc.DeleteTLSTrust(r.Context(), c.ID, protocol); err != nil {
+				respondError(w, r, errors.Wrapf(err, "delete %s TLS trust for cluster %q", protocol, c.ID))
+				return
+			}
 		}
 	}
 }

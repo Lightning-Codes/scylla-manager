@@ -81,6 +81,17 @@ func (p *CachedProvider) Client(ctx context.Context, clusterID uuid.UUID) (*Clie
 		return c.client, nil
 	}
 
+	// Revoke the previous generation before attempting a replacement. Old
+	// callers must not retain a transport that later invalidations can no
+	// longer see, and an inner-provider failure must leave the cell fail-closed.
+	previous := c.client
+	c.client = nil
+	c.ttl = time.Time{}
+	c.hostsTTL = time.Time{}
+	if previous != nil {
+		logutil.LogOnError(ctx, p.logger, previous.Close, "Couldn't close replaced scylla client")
+	}
+
 	// If not found or invalid, create a new one
 	client, err := p.inner(ctx, clusterID)
 	if err != nil {
@@ -105,21 +116,47 @@ func (p *CachedProvider) getClientTTL(clusterID uuid.UUID) *clientTTL {
 	return c
 }
 
-// Invalidate removes client for clusterID from cache.
+// Invalidate revokes the current client for clusterID while retaining the
+// stable cache cell. Keeping one cell prevents a concurrent Client call from
+// finishing on a detached entry that no later invalidation can reach.
 func (p *CachedProvider) Invalidate(clusterID uuid.UUID) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.clients, clusterID)
+	c := p.clients[clusterID]
+	p.mu.Unlock()
+	if c == nil {
+		return
+	}
+
+	c.mu.Lock()
+	client := c.client
+	c.client = nil
+	c.ttl = time.Time{}
+	c.hostsTTL = time.Time{}
+	c.mu.Unlock()
+	if client != nil {
+		logutil.LogOnError(context.Background(), p.logger, client.Close, "Couldn't close invalidated scylla client")
+	}
 }
 
 // Close removes all clients and closes them to clear up any resources.
 func (p *CachedProvider) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	clients := make([]*clientTTL, 0, len(p.clients))
+	for _, c := range p.clients {
+		clients = append(clients, c)
+	}
+	p.mu.Unlock()
 
-	for clusterID, c := range p.clients {
-		delete(p.clients, clusterID)
-		logutil.LogOnError(context.Background(), p.logger, c.client.Close, "Couldn't close scylla client")
+	for _, c := range clients {
+		c.mu.Lock()
+		client := c.client
+		c.client = nil
+		c.ttl = time.Time{}
+		c.hostsTTL = time.Time{}
+		c.mu.Unlock()
+		if client != nil {
+			logutil.LogOnError(context.Background(), p.logger, client.Close, "Couldn't close scylla client")
+		}
 	}
 
 	return nil

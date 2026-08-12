@@ -15,6 +15,10 @@ require (
 	github.com/scylladb/termtables v0.0.0-20191203121021-c4c0b6d42ff4
 )
 
+// Branch-local wiring: replace with a published upstream Swagger module
+// version before releasing the managerclient module.
+replace github.com/scylladb/scylla-manager/v3/swagger => ../../swagger
+
 require (
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
 	github.com/go-logr/logr v1.4.1 // indirect

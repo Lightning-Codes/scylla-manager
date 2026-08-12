@@ -17,7 +17,7 @@ import (
 )
 
 func TestCheckHostsConnectivityIntegration(t *testing.T) {
-	client, err := scyllaclient.NewClient(scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
+	client, err := scyllaclient.NewClient(ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestCheckHostsConnectivityIntegration(t *testing.T) {
 }
 
 func TestClientClosestDCIntegration(t *testing.T) {
-	client, err := scyllaclient.NewClient(scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
+	client, err := scyllaclient.NewClient(ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestClientClosestDCIntegration(t *testing.T) {
 }
 
 func TestPingAuthIntegration(t *testing.T) {
-	config := scyllaclient.TestConfig(ManagedClusterHosts(), "wrong auth token")
+	config := ManagedClusterAgentConfig(t, ManagedClusterHosts(), "wrong auth token")
 
 	client, err := scyllaclient.NewClient(config, log.NewDevelopment())
 	if err != nil {

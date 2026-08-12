@@ -24,6 +24,7 @@ type Config struct {
 	RequiresAuthentication bool
 	Timeout                time.Duration
 	TLSConfig              *tls.Config
+	Credentials            aws.CredentialsProvider
 }
 
 // SimplePing sends GET request to alternator port and expects 200 response code.
@@ -70,14 +71,16 @@ var unauthorisedMessage = []string{
 // ErrAlternatorQueryPingNotSupported is returned when alternator query ping is executed,
 // but managed cluster enforces alternator authentication.
 // See #4036 for more details.
-var ErrAlternatorQueryPingNotSupported = errors.New("ScyllaDB Manager does not support alternator query ping when authentication is enforced")
+var ErrAlternatorQueryPingNotSupported = errors.New("Alternator query ping requires configured credentials when authentication is enforced")
 
 // QueryPing checks if host is available, it returns RTT and error. Special errors
 // are ErrTimeout and ErrUnauthorised. Ping is based on executing
 // a real query.
 func QueryPing(ctx context.Context, config Config) (rtt time.Duration, err error) {
 	if config.RequiresAuthentication {
-		return 0, ErrAlternatorQueryPingNotSupported
+		if config.Credentials == nil {
+			return 0, ErrAlternatorQueryPingNotSupported
+		}
 	}
 
 	t := timeutc.Now()
@@ -99,7 +102,10 @@ func QueryPing(ctx context.Context, config Config) (rtt time.Duration, err error
 		BaseEndpoint: aws.String(config.Addr),
 		Region:       "scylla",
 		HTTPClient:   httpClient(config),
-		Credentials:  aws.AnonymousCredentials{},
+		Credentials:  config.Credentials,
+	}
+	if awsCfg.Credentials == nil {
+		awsCfg.Credentials = aws.AnonymousCredentials{}
 	}
 	client := dynamodb.NewFromConfig(awsCfg)
 

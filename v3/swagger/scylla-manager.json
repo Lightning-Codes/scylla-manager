@@ -38,17 +38,26 @@
         "auth_token": {
           "type": "string"
         },
+        "auth_token_set": {
+          "type": "boolean"
+        },
         "username": {
           "type": "string"
         },
         "password": {
           "type": "string"
         },
+        "cql_credentials_set": {
+          "type": "boolean"
+        },
         "alternator_access_key_id": {
           "type": "string"
         },
         "alternator_secret_access_key": {
           "type": "string"
+        },
+        "alternator_credentials_set": {
+          "type": "boolean"
         },
         "labels": {
           "type": "object",
@@ -63,6 +72,39 @@
         "ssl_user_key_file": {
           "type": "string",
           "format": "byte"
+        },
+        "ssl_user_cert_set": {
+          "type": "boolean"
+        },
+        "cql_ca_file": {
+          "type": "string",
+          "format": "byte"
+        },
+        "cql_server_name": {
+          "type": "string"
+        },
+        "cql_ca_set": {
+          "type": "boolean"
+        },
+        "alternator_ca_file": {
+          "type": "string",
+          "format": "byte"
+        },
+        "alternator_server_name": {
+          "type": "string"
+        },
+        "alternator_ca_set": {
+          "type": "boolean"
+        },
+        "agent_ca_file": {
+          "type": "string",
+          "format": "byte"
+        },
+        "agent_server_name": {
+          "type": "string"
+        },
+        "agent_ca_set": {
+          "type": "boolean"
         },
         "without_repair": {
           "type": "boolean"
@@ -109,6 +151,21 @@
             "type": "string"
           },
           "ssl": {
+            "type": "boolean"
+          },
+          "agent_tls_verified": {
+            "type": "boolean"
+          },
+          "cql_tls_verified": {
+            "type": "boolean"
+          },
+          "cql_auth_verified": {
+            "type": "boolean"
+          },
+          "alternator_tls_verified": {
+            "type": "boolean"
+          },
+          "alternator_auth_verified": {
             "type": "boolean"
           },
           "alternator_status": {
@@ -1560,6 +1617,16 @@
           {
             "type": "boolean",
             "name": "ssl_user_cert",
+            "in": "query"
+          },
+          {
+            "type": "boolean",
+            "name": "cql_ca",
+            "in": "query"
+          },
+          {
+            "type": "boolean",
+            "name": "alternator_ca",
             "in": "query"
           }
         ],

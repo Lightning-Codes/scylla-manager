@@ -70,6 +70,24 @@ ssl-user-cert-file: |
 ssl-user-key-file: |
   File `path` to key associated with --ssl-user-cert-file flag.
 
+cql-ca-file: |
+  File `path` to the CA bundle used to verify CQL server certificates. Must be used with --cql-server-name.
+
+cql-server-name: |
+  Expected DNS identity in CQL server certificates. Must be used with --cql-ca-file.
+
+alternator-ca-file: |
+  File `path` to the CA bundle used to verify Alternator server certificates. Must be used with --alternator-server-name.
+
+alternator-server-name: |
+  Expected DNS identity in Alternator server certificates. Must be used with --alternator-ca-file.
+
+agent-ca-file: |
+  File `path` to the CA bundle used to verify Scylla Manager Agent server certificates. Required with --agent-server-name.
+
+agent-server-name: |
+  Expected shared DNS identity in every Agent server certificate. Required with --agent-ca-file.
+
 without-repair: |
   When cluster is added, Manager schedules repair to repeat weekly.
   Use this flag to create a cluster without a scheduled repair.

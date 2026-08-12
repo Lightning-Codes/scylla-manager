@@ -27,7 +27,7 @@ var longPollingTimeoutSeconds = 1
 func TestRcloneS3ListDirAgentIntegration(t *testing.T) {
 	testHost := ManagedClusterHost()
 
-	client, err := scyllaclient.NewClient(scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
+	client, err := scyllaclient.NewClient(ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestRcloneDeletePathsInBatchesAgentIntegration(t *testing.T) {
 	)
 
 	S3InitBucket(t, testBucket)
-	client, err := scyllaclient.NewClient(scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopmentWithLevel(zapcore.ErrorLevel))
+	client, err := scyllaclient.NewClient(ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopmentWithLevel(zapcore.ErrorLevel))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestRcloneDeletePathsInBatchesAgentIntegration(t *testing.T) {
 }
 
 func TestRcloneSkippingFilesAgentIntegration(t *testing.T) {
-	config := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
+	config := ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken())
 	client, err := scyllaclient.NewClient(config, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -246,7 +246,7 @@ func TestRcloneSkippingFilesAgentIntegration(t *testing.T) {
 }
 
 func TestRcloneStoppingTransferIntegration(t *testing.T) {
-	config := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
+	config := ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken())
 	client, err := scyllaclient.NewClient(config, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -313,7 +313,7 @@ func TestRcloneStoppingTransferIntegration(t *testing.T) {
 }
 
 func TestRcloneJobProgressIntegration(t *testing.T) {
-	config := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
+	config := ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken())
 	client, err := scyllaclient.NewClient(config, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -442,7 +442,7 @@ func TestRcloneSuffixOptionIntegration(t *testing.T) {
 		secondSuffix   = ".suffix_2"
 	)
 
-	config := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
+	config := ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken())
 	client, err := scyllaclient.NewClient(config, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)

@@ -90,6 +90,10 @@ func ParseConfigFiles(files []string) (Config, error) {
 }
 
 func (c Config) Validate() (errs error) {
+	if c.TLSCertFile == "" || c.TLSKeyFile == "" {
+		errs = multierr.Append(errs, errors.New("tls_cert_file and tls_key_file are required"))
+	}
+
 	// Validate Scylla config
 	errs = multierr.Append(errs, errors.Wrap(c.Scylla.Validate(), "scylla"))
 
@@ -99,9 +103,9 @@ func (c Config) Validate() (errs error) {
 	return
 }
 
-// HasTLSCert returns true iff TLSCertFile or TLSKeyFile is set.
+// HasTLSCert returns true iff both TLS certificate and key files are set.
 func (c Config) HasTLSCert() bool {
-	return c.TLSCertFile != "" || c.TLSKeyFile != ""
+	return c.TLSCertFile != "" && c.TLSKeyFile != ""
 }
 
 // Obfuscate returns Config with secrets replaced with ******.

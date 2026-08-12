@@ -4,11 +4,13 @@ package restapi
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gocql/gocql"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/util"
 )
 
@@ -48,13 +50,30 @@ func TestRespondError(t *testing.T) {
 		response := httptest.NewRecorder()
 
 		respondError(response, request, errors.Wrap(err, "specific_msg"))
-		expected := `{"message":"specific_msg: wrapped: unknown problem","details":"","trace_id":""}` + "\n"
+		expected := `{"message":"internal server error; see Manager logs with the trace ID","details":"","trace_id":""}` + "\n"
 		if diff := cmp.Diff(response.Body.String(), expected); diff != "" {
 			t.Fatal(diff)
 		}
 
 		if response.Code != http.StatusInternalServerError {
 			t.Errorf("Response status is wrong, got '%d' want '%d'", response.Code, http.StatusInternalServerError)
+		}
+	})
+
+	t.Run("data-plane validation does not expose endpoint identity", func(t *testing.T) {
+		err := util.ErrValidate(errors.Wrap(cluster.ErrSecureConnectivity, "x509: certificate is valid for secret.internal.example"))
+		response := httptest.NewRecorder()
+
+		respondError(response, request, errors.Wrap(err, "update cluster"))
+		expected := `{"message":"secure cluster connectivity validation failed; see Manager logs with the trace ID","details":"","trace_id":""}` + "\n"
+		if diff := cmp.Diff(response.Body.String(), expected); diff != "" {
+			t.Fatal(diff)
+		}
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("unexpected status %d", response.Code)
+		}
+		if strings.Contains(response.Body.String(), "secret.internal.example") {
+			t.Fatal("response exposed the configured server name")
 		}
 	})
 }

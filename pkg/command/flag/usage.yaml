@@ -39,3 +39,9 @@ api-cert-file: |
 
 api-key-file: |
   File `path` to HTTPS client key associated with --api-cert-file flag (envvar SCYLLA_MANAGER_API_KEY_FILE).
+
+api-ca-file: |
+  File `path` to the PEM CA bundle used to verify the Scylla Manager API (envvar SCYLLA_MANAGER_API_CA_FILE). Must be used with --api-server-name.
+
+api-server-name: |
+  Expected DNS identity in the Scylla Manager API serving certificate (envvar SCYLLA_MANAGER_API_SERVER_NAME). Must be used with --api-ca-file.

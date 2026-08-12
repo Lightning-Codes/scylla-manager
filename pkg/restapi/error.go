@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/render"
 	"github.com/pkg/errors"
 	"github.com/scylladb/go-log"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/util"
 )
 
@@ -45,6 +46,13 @@ func respondError(w http.ResponseWriter, r *http.Request, err error, details ...
 			Message:    errors.Wrap(err, "get resource").Error(),
 			TraceID:    log.TraceID(r.Context()),
 		})
+	case util.IsErrValidate(cause) && errors.Is(err, cluster.ErrSecureConnectivity):
+		render.Respond(w, r, &httpError{
+			StatusCode: http.StatusBadRequest,
+			Details:    strings.Join(details, "\n\n"),
+			Message:    "secure cluster connectivity validation failed; see Manager logs with the trace ID",
+			TraceID:    log.TraceID(r.Context()),
+		})
 	case util.IsErrValidate(cause):
 		render.Respond(w, r, &httpError{
 			StatusCode: http.StatusBadRequest,
@@ -56,7 +64,7 @@ func respondError(w http.ResponseWriter, r *http.Request, err error, details ...
 		render.Respond(w, r, &httpError{
 			StatusCode: http.StatusInternalServerError,
 			Details:    strings.Join(details, "\n\n"),
-			Message:    err.Error(),
+			Message:    "internal server error; see Manager logs with the trace ID",
 			TraceID:    log.TraceID(r.Context()),
 		})
 	}

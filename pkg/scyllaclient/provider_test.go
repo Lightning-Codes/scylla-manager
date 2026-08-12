@@ -83,7 +83,7 @@ func TestCachedProvider(t *testing.T) {
 	// Cached but changed
 	m.called = false
 	m.client.Config().Hosts[0] = "" // make hosts change without starting new server
-	time.Sleep(15 * time.Second)    // cache checks for changed hosts every 15s
+	time.Sleep(16 * time.Second)    // cache checks for changed hosts every 15s; leave headroom for the boundary
 	c, err = p.Client(context.Background(), id)
 	if !m.called {
 		t.Fatal("not called")

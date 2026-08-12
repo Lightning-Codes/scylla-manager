@@ -5,6 +5,7 @@ package managerclient
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"net/http"
 	"net/url"
@@ -53,13 +54,46 @@ var DefaultTransport = &http.Transport{
 // DefaultTLSConfig specifies default TLS configuration used when creating a new
 // client.
 var DefaultTLSConfig = func() *tls.Config {
-	return &tls.Config{
-		InsecureSkipVerify: true,
-	}
+	return &tls.Config{MinVersion: tls.VersionTLS12}
 }
 
 // Option allows decorating underlying HTTP client in NewClient.
 type Option func(*http.Client)
+
+// ClusterSecretDeleteOptions selects individual cluster secret entries to remove.
+type ClusterSecretDeleteOptions struct {
+	CQLCredentials        bool
+	AlternatorCredentials bool
+	SSLUserCert           bool
+	CQLCA                 bool
+	AlternatorCA          bool
+}
+
+// WithTLSConfig configures the Manager API client with an explicit TLS
+// configuration. The config is cloned before use.
+func WithTLSConfig(config *tls.Config) Option {
+	return func(c *http.Client) {
+		t := DefaultTransport.Clone()
+		t.TLSClientConfig = config.Clone()
+		c.Transport = t
+	}
+}
+
+// StrictTLSConfig builds a TLS configuration for verified Manager API mTLS.
+func StrictTLSConfig(caPEM []byte, serverName string, certificate *tls.Certificate) (*tls.Config, error) {
+	if serverName == "" {
+		return nil, errors.New("missing Manager API server name")
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, errors.New("Manager API CA contains no certificates")
+	}
+	config := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, ServerName: serverName}
+	if certificate != nil {
+		config.Certificates = []tls.Certificate{*certificate}
+	}
+	return config, nil
+}
 
 func NewClient(rawURL string, opts ...Option) (Client, error) {
 	u, err := url.Parse(rawURL)
@@ -72,7 +106,7 @@ func NewClient(rawURL string, opts ...Option) (Client, error) {
 	})
 
 	httpClient := &http.Client{
-		Transport: DefaultTransport,
+		Transport: DefaultTransport.Clone(),
 	}
 	for _, o := range opts {
 		o(httpClient)
@@ -138,24 +172,38 @@ func (c *Client) DeleteCluster(ctx context.Context, clusterID string) error {
 
 // DeleteClusterSecrets removes cluster secrets.
 func (c *Client) DeleteClusterSecrets(ctx context.Context, clusterID string, cqlCreds, alternatorCreds, sslUserCert bool) error {
+	return c.DeleteClusterSecretsWithOptions(ctx, clusterID, ClusterSecretDeleteOptions{
+		CQLCredentials: cqlCreds, AlternatorCredentials: alternatorCreds, SSLUserCert: sslUserCert,
+	})
+}
+
+// DeleteClusterSecretsWithOptions removes selected cluster secret entries.
+func (c *Client) DeleteClusterSecretsWithOptions(ctx context.Context, clusterID string, opts ClusterSecretDeleteOptions) error {
 	ok := false
 	p := &operations.DeleteClusterClusterIDParams{
 		Context:   ctx,
 		ClusterID: clusterID,
 	}
-	if cqlCreds {
-		p.CqlCreds = &cqlCreds
+	if opts.CQLCredentials {
+		p.CqlCreds = &opts.CQLCredentials
 		ok = true
 	}
-	if alternatorCreds {
-		p.AlternatorCreds = &alternatorCreds
+	if opts.AlternatorCredentials {
+		p.AlternatorCreds = &opts.AlternatorCredentials
 		ok = true
 	}
-	if sslUserCert {
-		p.SslUserCert = &sslUserCert
+	if opts.SSLUserCert {
+		p.SslUserCert = &opts.SSLUserCert
 		ok = true
 	}
-
+	if opts.CQLCA {
+		p.CqlCa = &opts.CQLCA
+		ok = true
+	}
+	if opts.AlternatorCA {
+		p.AlternatorCa = &opts.AlternatorCA
+		ok = true
+	}
 	if !ok {
 		return nil
 	}

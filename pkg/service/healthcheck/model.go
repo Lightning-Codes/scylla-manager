@@ -20,25 +20,30 @@ const (
 
 // NodeStatus represents the status of a particular node.
 type NodeStatus struct {
-	Datacenter       string  `json:"dc"`
-	HostID           string  `json:"host_id"`
-	Host             string  `json:"host"`
-	Status           string  `json:"status"`
-	SSL              bool    `json:"ssl"`
-	AlternatorStatus string  `json:"alternator_status"`
-	AlternatorRtt    float64 `json:"alternator_rtt_ms"`
-	AlternatorCause  string  `json:"alternator_cause"`
-	CQLStatus        string  `json:"cql_status"`
-	CQLRtt           float64 `json:"cql_rtt_ms"`
-	CQLCause         string  `json:"cql_cause"`
-	RESTStatus       string  `json:"rest_status"`
-	RESTRtt          float64 `json:"rest_rtt_ms"`
-	RESTCause        string  `json:"rest_cause"`
-	TotalRAM         int64   `json:"total_ram"`
-	Uptime           int64   `json:"uptime"`
-	CPUCount         int64   `json:"cpu_count"`
-	ScyllaVersion    string  `json:"scylla_version"`
-	AgentVersion     string  `json:"agent_version"`
+	Datacenter             string  `json:"dc"`
+	HostID                 string  `json:"host_id"`
+	Host                   string  `json:"host"`
+	Status                 string  `json:"status"`
+	SSL                    bool    `json:"ssl"`
+	AgentTLSVerified       bool    `json:"agent_tls_verified"`
+	CQLTLSVerified         bool    `json:"cql_tls_verified"`
+	CQLAuthVerified        bool    `json:"cql_auth_verified"`
+	AlternatorTLSVerified  bool    `json:"alternator_tls_verified"`
+	AlternatorAuthVerified bool    `json:"alternator_auth_verified"`
+	AlternatorStatus       string  `json:"alternator_status"`
+	AlternatorRtt          float64 `json:"alternator_rtt_ms"`
+	AlternatorCause        string  `json:"alternator_cause"`
+	CQLStatus              string  `json:"cql_status"`
+	CQLRtt                 float64 `json:"cql_rtt_ms"`
+	CQLCause               string  `json:"cql_cause"`
+	RESTStatus             string  `json:"rest_status"`
+	RESTRtt                float64 `json:"rest_rtt_ms"`
+	RESTCause              string  `json:"rest_cause"`
+	TotalRAM               int64   `json:"total_ram"`
+	Uptime                 int64   `json:"uptime"`
+	CPUCount               int64   `json:"cpu_count"`
+	ScyllaVersion          string  `json:"scylla_version"`
+	AgentVersion           string  `json:"agent_version"`
 }
 
 func makeNodeStatus(src []scyllaclient.NodeStatusInfo) []NodeStatus {

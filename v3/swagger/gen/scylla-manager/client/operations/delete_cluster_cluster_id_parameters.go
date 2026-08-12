@@ -61,11 +61,14 @@ DeleteClusterClusterIDParams contains all the parameters to send to the API endp
 for the delete cluster cluster ID operation typically these are written to a http.Request
 */
 type DeleteClusterClusterIDParams struct {
-
+	/*AlternatorCa*/
+	AlternatorCa *bool
 	/*AlternatorCreds*/
 	AlternatorCreds *bool
 	/*ClusterID*/
 	ClusterID string
+	/*CqlCa*/
+	CqlCa *bool
 	/*CqlCreds*/
 	CqlCreds *bool
 	/*SslUserCert*/
@@ -109,6 +112,17 @@ func (o *DeleteClusterClusterIDParams) SetHTTPClient(client *http.Client) {
 	o.HTTPClient = client
 }
 
+// WithAlternatorCa adds the alternatorCa to the delete cluster cluster ID params
+func (o *DeleteClusterClusterIDParams) WithAlternatorCa(alternatorCa *bool) *DeleteClusterClusterIDParams {
+	o.SetAlternatorCa(alternatorCa)
+	return o
+}
+
+// SetAlternatorCa adds the alternatorCa to the delete cluster cluster ID params
+func (o *DeleteClusterClusterIDParams) SetAlternatorCa(alternatorCa *bool) {
+	o.AlternatorCa = alternatorCa
+}
+
 // WithAlternatorCreds adds the alternatorCreds to the delete cluster cluster ID params
 func (o *DeleteClusterClusterIDParams) WithAlternatorCreds(alternatorCreds *bool) *DeleteClusterClusterIDParams {
 	o.SetAlternatorCreds(alternatorCreds)
@@ -129,6 +143,17 @@ func (o *DeleteClusterClusterIDParams) WithClusterID(clusterID string) *DeleteCl
 // SetClusterID adds the clusterId to the delete cluster cluster ID params
 func (o *DeleteClusterClusterIDParams) SetClusterID(clusterID string) {
 	o.ClusterID = clusterID
+}
+
+// WithCqlCa adds the cqlCa to the delete cluster cluster ID params
+func (o *DeleteClusterClusterIDParams) WithCqlCa(cqlCa *bool) *DeleteClusterClusterIDParams {
+	o.SetCqlCa(cqlCa)
+	return o
+}
+
+// SetCqlCa adds the cqlCa to the delete cluster cluster ID params
+func (o *DeleteClusterClusterIDParams) SetCqlCa(cqlCa *bool) {
+	o.CqlCa = cqlCa
 }
 
 // WithCqlCreds adds the cqlCreds to the delete cluster cluster ID params
@@ -161,6 +186,22 @@ func (o *DeleteClusterClusterIDParams) WriteToRequest(r runtime.ClientRequest, r
 	}
 	var res []error
 
+	if o.AlternatorCa != nil {
+
+		// query param alternator_ca
+		var qrAlternatorCa bool
+		if o.AlternatorCa != nil {
+			qrAlternatorCa = *o.AlternatorCa
+		}
+		qAlternatorCa := swag.FormatBool(qrAlternatorCa)
+		if qAlternatorCa != "" {
+			if err := r.SetQueryParam("alternator_ca", qAlternatorCa); err != nil {
+				return err
+			}
+		}
+
+	}
+
 	if o.AlternatorCreds != nil {
 
 		// query param alternator_creds
@@ -180,6 +221,22 @@ func (o *DeleteClusterClusterIDParams) WriteToRequest(r runtime.ClientRequest, r
 	// path param cluster_id
 	if err := r.SetPathParam("cluster_id", o.ClusterID); err != nil {
 		return err
+	}
+
+	if o.CqlCa != nil {
+
+		// query param cql_ca
+		var qrCqlCa bool
+		if o.CqlCa != nil {
+			qrCqlCa = *o.CqlCa
+		}
+		qCqlCa := swag.FormatBool(qrCqlCa)
+		if qCqlCa != "" {
+			if err := r.SetQueryParam("cql_ca", qCqlCa); err != nil {
+				return err
+			}
+		}
+
 	}
 
 	if o.CqlCreds != nil {

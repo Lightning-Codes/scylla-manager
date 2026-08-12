@@ -247,7 +247,10 @@ batch_size_fail_threshold_in_kb: 1024
   # - com.scylladb.auth.TransitionalAuthenticator requires username/password pair
   #   to authenticate in the same manner as PasswordAuthenticator, but improper credentials
   #   result in being logged in as an anonymous user. Use for upgrading clusters' auth.
-authenticator: PasswordAuthenticator
+# Authentication is enabled together with TLS by scylla-ssl.yaml. Keeping the
+# plaintext fixture unauthenticated proves legacy discovery without ever
+# transmitting credentials over an unverified transport.
+#authenticator: PasswordAuthenticator
 
   # Authorization backend, implementing IAuthorizer; used to limit access/provide permissions
   # Out of the box, Scylla provides org.apache.cassandra.auth.{AllowAllAuthorizer,
@@ -644,7 +647,8 @@ api_ui_dir: /usr/lib/scylla/swagger-ui/dist/
 api_doc_dir: /usr/lib/scylla/api/api-doc/
 alternator_port: 8000
 alternator_write_isolation: only_rmw_uses_lwt
-alternator_enforce_authorization: true
+# Enabled together with Alternator HTTPS by scylla-ssl.yaml.
+#alternator_enforce_authorization: true
 enable_ipv6_dns_lookup: true
 
 object_storage_endpoints:

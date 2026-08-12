@@ -49,8 +49,14 @@ func (m ClusterStatus) Validate(formats strfmt.Registry) error {
 // swagger:model ClusterStatusItems0
 type ClusterStatusItems0 struct {
 
+	// agent tls verified
+	AgentTLSVerified bool `json:"agent_tls_verified,omitempty"`
+
 	// agent version
 	AgentVersion string `json:"agent_version,omitempty"`
+
+	// alternator auth verified
+	AlternatorAuthVerified bool `json:"alternator_auth_verified,omitempty"`
 
 	// alternator cause
 	AlternatorCause string `json:"alternator_cause,omitempty"`
@@ -61,8 +67,14 @@ type ClusterStatusItems0 struct {
 	// alternator status
 	AlternatorStatus string `json:"alternator_status,omitempty"`
 
+	// alternator tls verified
+	AlternatorTLSVerified bool `json:"alternator_tls_verified,omitempty"`
+
 	// cpu count
 	CPUCount int64 `json:"cpu_count,omitempty"`
+
+	// cql auth verified
+	CqlAuthVerified bool `json:"cql_auth_verified,omitempty"`
 
 	// cql cause
 	CqlCause string `json:"cql_cause,omitempty"`
@@ -72,6 +84,9 @@ type ClusterStatusItems0 struct {
 
 	// cql status
 	CqlStatus string `json:"cql_status,omitempty"`
+
+	// cql tls verified
+	CqlTLSVerified bool `json:"cql_tls_verified,omitempty"`
 
 	// dc
 	Dc string `json:"dc,omitempty"`

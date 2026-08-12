@@ -128,6 +128,21 @@ func CQLSSLOptions() *gocql.SslOptions {
 	}
 }
 
+// ManagedClusterCAFile returns the CA file used by the managed-cluster TLS
+// integration fixture.
+func ManagedClusterCAFile() string {
+	if !flag.Parsed() {
+		flag.Parse()
+	}
+	return *flagCAFile
+}
+
+// ManagedClusterTLSServerName is the shared DNS identity in the integration
+// fixture's Agent and Scylla serving certificate.
+func ManagedClusterTLSServerName() string {
+	return "scylla-manager-agent.test"
+}
+
 // CQLTimeout returns timeout for cql session.
 func CQLTimeout() time.Duration {
 	if !flag.Parsed() {

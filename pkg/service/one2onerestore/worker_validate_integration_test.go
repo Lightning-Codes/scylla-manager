@@ -242,7 +242,7 @@ func TestWorkerValidateClustersIntegration(t *testing.T) {
 func newTestWorker(t *testing.T, hosts []string) (*worker, *testutils.HackableRoundTripper) {
 	t.Helper()
 	hrt := testutils.NewHackableRoundTripper(scyllaclient.DefaultTransport())
-	cfg := scyllaclient.TestConfig(hosts, testutils.AgentAuthToken())
+	cfg := testutils.ManagedClusterAgentConfig(t, hosts, testutils.AgentAuthToken())
 	cfg.Transport = hrt
 	sc, err := scyllaclient.NewClient(cfg, log.NopLogger)
 	if err != nil {

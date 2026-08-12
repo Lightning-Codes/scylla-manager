@@ -42,20 +42,30 @@ type ClusterSlice []*models.Cluster
 
 // Render renders ClusterSlice in a tabular format.
 func (cs ClusterSlice) Render(w io.Writer) error {
-	t := table.New("ID", "Name", "Labels", "Port", "Credentials")
+	t := table.New("ID", "Name", "Labels", "Port", "Credentials", "TLS trust")
 	for _, c := range cs {
 		p := "default"
 		if c.Port != 0 {
 			p = fmt.Sprint(c.Port)
 		}
 		var creds []string
-		if c.Username != "" {
+		if c.CqlCredentialsSet || c.Username != "" {
 			creds = append(creds, "CQL")
 		}
-		if c.AlternatorAccessKeyID != "" {
+		if c.AlternatorCredentialsSet || c.AlternatorAccessKeyID != "" {
 			creds = append(creds, "Alternator")
 		}
-		t.AddRow(c.ID, c.Name, formatLabels(c.Labels), p, strings.Join(creds, ", "))
+		var trusts []string
+		if c.CqlCaSet {
+			trusts = append(trusts, "CQL")
+		}
+		if c.AlternatorCaSet {
+			trusts = append(trusts, "Alternator")
+		}
+		if c.AgentCaSet {
+			trusts = append(trusts, "Agent")
+		}
+		t.AddRow(c.ID, c.Name, formatLabels(c.Labels), p, strings.Join(creds, ", "), strings.Join(trusts, ", "))
 	}
 	if _, err := w.Write([]byte(t.String())); err != nil {
 		return err
@@ -129,8 +139,11 @@ func (cs ClusterStatus) Render(w io.Writer) error {
 
 		if s.AlternatorStatus != "" {
 			status := s.AlternatorStatus
-			if s.Ssl {
-				status += " SSL"
+			if s.AlternatorTLSVerified {
+				status += " TLS"
+			}
+			if s.AlternatorAuthVerified {
+				status += " AUTH"
 			}
 			apiStatuses = append(apiStatuses, fmt.Sprintf("%s (%.0fms)", status, s.AlternatorRttMs))
 		} else if cs.hasAnyAlternator() {
@@ -142,8 +155,11 @@ func (cs ClusterStatus) Render(w io.Writer) error {
 
 		if s.CqlStatus != "" {
 			status := s.CqlStatus
-			if s.Ssl {
-				status += " SSL"
+			if s.CqlTLSVerified {
+				status += " TLS"
+			}
+			if s.CqlAuthVerified {
+				status += " AUTH"
 			}
 			apiStatuses = append(apiStatuses, fmt.Sprintf("%s (%.0fms)", status, s.CqlRttMs))
 		} else {
@@ -154,7 +170,11 @@ func (cs ClusterStatus) Render(w io.Writer) error {
 		}
 
 		if s.RestStatus != "" {
-			apiStatuses = append(apiStatuses, fmt.Sprintf("%s (%.0fms)", s.RestStatus, s.RestRttMs))
+			status := s.RestStatus
+			if s.AgentTLSVerified {
+				status += " TLS"
+			}
+			apiStatuses = append(apiStatuses, fmt.Sprintf("%s (%.0fms)", status, s.RestRttMs))
 		} else {
 			apiStatuses = append(apiStatuses, "-")
 		}

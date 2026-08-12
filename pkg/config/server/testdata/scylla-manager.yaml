@@ -26,7 +26,7 @@ database:
 
 ssl:
   cert_file: ca.pem
-  validate: false
+  validate: true
   user_key_file: ssl.key
   user_cert_file: ssl.cert
 

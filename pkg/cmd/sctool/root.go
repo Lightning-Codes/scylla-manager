@@ -4,7 +4,7 @@ package main
 
 import (
 	"crypto/tls"
-	"net/http"
+	"net/url"
 	"os"
 
 	"github.com/pkg/errors"
@@ -20,9 +20,11 @@ type rootCommand struct {
 
 	client *managerclient.Client
 
-	apiURL      string
-	apiCertFile string
-	apiKeyFile  string
+	apiURL        string
+	apiCertFile   string
+	apiKeyFile    string
+	apiCAFile     string
+	apiServerName string
 }
 
 func newRootCommand(client *managerclient.Client) *cobra.Command {
@@ -46,6 +48,8 @@ func (cmd *rootCommand) init() {
 	w.GlobalAPIURL(&cmd.apiURL, apiURL())
 	w.GlobalAPICertFile(&cmd.apiCertFile)
 	w.GlobalAPIKeyFile(&cmd.apiKeyFile)
+	w.GlobalAPICAFile(&cmd.apiCAFile)
+	w.GlobalAPIServerName(&cmd.apiServerName)
 }
 
 func (cmd *rootCommand) preRun() error {
@@ -59,17 +63,43 @@ func (cmd *rootCommand) preRun() error {
 	if cmd.apiKeyFile != "" && cmd.apiCertFile == "" {
 		return errors.New("missing --api-cert-file flag")
 	}
+	if cmd.apiCAFile == "" && cmd.apiServerName != "" {
+		return errors.New("missing --api-ca-file flag")
+	}
+	if cmd.apiCAFile != "" && cmd.apiServerName == "" {
+		return errors.New("missing --api-server-name flag")
+	}
+	parsedURL, err := url.Parse(cmd.apiURL)
+	if err != nil {
+		return errors.Wrap(err, "parse Manager API URL")
+	}
+	if (cmd.apiCAFile != "" || cmd.apiCertFile != "") && parsedURL.Scheme != "https" {
+		return errors.New("Manager API URL must use https when TLS options are configured")
+	}
 
 	var opts []managerclient.Option
+	var certificate *tls.Certificate
 	if cmd.apiCertFile != "" {
 		cert, err := tls.LoadX509KeyPair(cmd.apiCertFile, cmd.apiKeyFile)
 		if err != nil {
 			return errors.Wrap(err, "load client certificate")
 		}
-		opts = append(opts, func(c *http.Client) {
-			t := c.Transport.(*http.Transport)
-			t.TLSClientConfig.Certificates = []tls.Certificate{cert}
-		})
+		certificate = &cert
+	}
+	if cmd.apiCAFile != "" {
+		ca, err := os.ReadFile(cmd.apiCAFile)
+		if err != nil {
+			return errors.Wrap(err, "load Manager API CA")
+		}
+		tlsConfig, err := managerclient.StrictTLSConfig(ca, cmd.apiServerName, certificate)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, managerclient.WithTLSConfig(tlsConfig))
+	} else if certificate != nil {
+		tlsConfig := managerclient.DefaultTLSConfig()
+		tlsConfig.Certificates = []tls.Certificate{*certificate}
+		opts = append(opts, managerclient.WithTLSConfig(tlsConfig))
 	}
 
 	c, err := managerclient.NewClient(cmd.apiURL, opts...)

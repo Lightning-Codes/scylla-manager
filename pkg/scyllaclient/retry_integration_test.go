@@ -25,7 +25,7 @@ func TestRetryWithTimeoutIntegration(t *testing.T) {
 	if IsIPV6Network() {
 		t.Skip("DB node do not have ip6tables and related modules to make it work properly")
 	}
-	hosts, err := allHosts()
+	hosts, err := allHosts(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,8 +63,9 @@ func TestRetryWithTimeoutIntegration(t *testing.T) {
 	}
 }
 
-func allHosts() ([]string, error) {
-	client, err := scyllaclient.NewClient(scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
+func allHosts(t *testing.T) ([]string, error) {
+	t.Helper()
+	client, err := scyllaclient.NewClient(ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +98,7 @@ func testRetry(t *testing.T, hosts []string, n int, shouldTimeout bool) error {
 
 	triedHosts := make(map[string]int)
 
-	config := scyllaclient.TestConfig(hosts, AgentAuthToken())
+	config := ManagedClusterAgentConfig(t, hosts, AgentAuthToken())
 	config.Transport = hostRecorder(scyllaclient.DefaultTransport(), triedHosts)
 
 	if err := block(context.Background(), hosts[0:n]); err != nil {

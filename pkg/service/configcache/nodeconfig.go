@@ -21,6 +21,18 @@ type NodeConfig struct {
 
 // NewNodeConfig creates and initializes new node configuration struct containing TLS configuration of CQL and Alternator.
 func NewNodeConfig(c *cluster.Cluster, nodeInfo *scyllaclient.NodeInfo, secretsStore store.Store, host, dc, rack string) (config NodeConfig, err error) {
+	if nodeInfo == nil {
+		return NodeConfig{}, errors.New("building node config: node info is unavailable")
+	}
+	if nodeInfo.ClientEncryptionEnabled && c.ForceTLSDisabled {
+		return NodeConfig{}, errors.New("building node config: CQL TLS is advertised but force TLS disabled is set")
+	}
+	if (nodeInfo.CqlPasswordProtected || nodeInfo.ClientEncryptionRequireAuth) && !nodeInfo.ClientEncryptionEnabled {
+		return NodeConfig{}, errors.New("building node config: CQL authentication requires TLS")
+	}
+	if nodeInfo.AlternatorEnforceAuthorization && !nodeInfo.AlternatorEncryptionEnabled() {
+		return NodeConfig{}, errors.New("building node config: Alternator authentication requires TLS")
+	}
 	cqlTLS, err := newCQLTLSConfigIfEnabled(c, nodeInfo, secretsStore, host)
 	if err != nil {
 		return NodeConfig{}, errors.Wrap(err, "building node config")

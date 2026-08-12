@@ -23,7 +23,7 @@ func (v *entryHolder) UnmarshalBinary(data []byte) error {
 }
 
 // PutWithRollback gets former value of entry and returns a function to restore it.
-func PutWithRollback(store Store, e Entry) (func(), error) {
+func PutWithRollback(store Store, e Entry) (func() error, error) {
 	old := &entryHolder{
 		Entry: e,
 	}
@@ -34,11 +34,10 @@ func PutWithRollback(store Store, e Entry) (func(), error) {
 	if err := store.Put(e); err != nil {
 		return nil, errors.Wrap(err, "put")
 	}
-	return func() {
+	return func() error {
 		if old.data == nil {
-			store.Delete(old) // nolint: errcheck
-		} else {
-			store.Put(old) // nolint: errcheck
+			return errors.Wrap(store.Delete(old), "delete replacement")
 		}
+		return errors.Wrap(store.Put(old), "restore previous value")
 	}, nil
 }

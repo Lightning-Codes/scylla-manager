@@ -72,7 +72,7 @@ func newTestHelper(t *testing.T) *testHelper {
 func newTestClient(t *testing.T, hrt *HackableRoundTripper, logger log.Logger) *scyllaclient.Client {
 	t.Helper()
 
-	config := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
+	config := ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken())
 	config.Timeout = 15 * time.Second
 	config.Transport = hrt
 	config.Backoff.MaxRetries = 5

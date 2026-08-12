@@ -57,6 +57,24 @@ ssl-user-cert-file: |
 ssl-user-key-file: |
   File `path` to key associated with --ssl-user-cert-file flag.
 
+cql-ca-file: |
+  File `path` to the CA bundle used to verify CQL server certificates. Must be changed with --cql-server-name.
+
+cql-server-name: |
+  Expected DNS identity in CQL server certificates. Must be changed with --cql-ca-file.
+
+alternator-ca-file: |
+  File `path` to the CA bundle used to verify Alternator server certificates. Must be changed with --alternator-server-name.
+
+alternator-server-name: |
+  Expected DNS identity in Alternator server certificates. Must be changed with --alternator-ca-file.
+
+agent-ca-file: |
+  File `path` to the CA bundle used to verify Scylla Manager Agent server certificates. Must be changed with --agent-server-name.
+
+agent-server-name: |
+  Expected shared DNS identity in every Agent server certificate. Must be changed with --agent-ca-file.
+
 delete-cql-credentials: |
   Deletes CQL username and password, added with --username and --password.
 
@@ -65,6 +83,12 @@ delete-alternator-credentials: |
 
 delete-ssl-user-cert: |
   Deletes SSL user certificate, added with --ssl-user-cert-file flag.
+
+delete-cql-ca: |
+  Deletes the complete CQL CA and server-name trust entry. CQL TLS fails closed until replacement trust is set.
+
+delete-alternator-ca: |
+  Deletes the complete Alternator CA and server-name trust entry. Alternator TLS fails closed until replacement trust is set.
 
 force-tls-disabled: |
   Forces Scylla Manager to always disable TLS for the cluster's CQL session, even if TLS is enabled in scylla.yaml.

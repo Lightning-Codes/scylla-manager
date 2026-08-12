@@ -70,7 +70,7 @@ type clusterHelper struct {
 func newCluster(t *testing.T, hosts []string) clusterHelper {
 	logger := log.NewDevelopmentWithLevel(zapcore.InfoLevel)
 	hrt := NewHackableRoundTripper(scyllaclient.DefaultTransport())
-	clientCfg := scyllaclient.TestConfig(hosts, AgentAuthToken())
+	clientCfg := ManagedClusterAgentConfig(t, hosts, AgentAuthToken())
 	clientCfg.Backoff.MaxRetries = 0
 	client := newTestClient(t, hrt, logger.Named("client"), &clientCfg)
 	rootSession := CreateSessionAndDropAllKeyspaces(t, client)

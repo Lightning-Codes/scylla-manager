@@ -22,9 +22,9 @@
 # The TLSv1.0 should never be used as it's deprecated.
 #tls_mode: TLSv1.2
 
-# TLS certificate and key files to use with HTTPS. The files must contain PEM
-# encoded data. If not set a self-signed certificate will be generated,
-# the certificate is valid for 1 year after start and uses EC P256 private key.
+# TLS certificate and key files to use with HTTPS. Both are required and must
+# contain PEM encoded data. Use a certificate signed by a stable cluster CA;
+# ephemeral self-signed certificates are deliberately not supported.
 #tls_cert_file:
 #tls_key_file:
 

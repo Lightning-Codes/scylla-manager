@@ -25,6 +25,7 @@ import (
 
 	"github.com/scylladb/scylla-manager/v3/pkg/schema/table"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
+	"github.com/scylladb/scylla-manager/v3/pkg/secrets"
 	"github.com/scylladb/scylla-manager/v3/pkg/store"
 	. "github.com/scylladb/scylla-manager/v3/pkg/testutils"
 	. "github.com/scylladb/scylla-manager/v3/pkg/testutils/db"
@@ -69,9 +70,9 @@ func TestStatus_Ping_Independent_From_REST_Integration(t *testing.T) {
 	}
 
 	scyllaClientProvider := func(context.Context, uuid.UUID) (*scyllaclient.Client, error) {
-		sc := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
+		sc := ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken())
 		sc.Timeout = time.Second
-		sc.Transport = NewHackableRoundTripper(scyllaclient.DefaultTransport())
+		sc.Transport = NewHackableRoundTripper(managedClusterAgentTransport(t))
 		return scyllaclient.NewClient(sc, logger.Named("scylla"))
 	}
 
@@ -86,6 +87,7 @@ func TestStatus_Ping_Independent_From_REST_Integration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	configureManagedClusterCredentials(t, clusterSvc, testCluster)
 
 	configCacheSvc := configcache.NewService(configcache.DefaultConfig(), clusterSvc, scyllaClientProvider, s, logger.Named("config-cache"))
 	configCacheSvc.Init(context.Background())
@@ -172,6 +174,7 @@ func TestStatusIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	configureManagedClusterCredentials(t, clusterSvc, c)
 
 	testStatusIntegration(t, c.ID, clusterSvc, clusterSvc.GetClusterByID, s, IsSSLEnabled())
 }
@@ -203,6 +206,7 @@ func TestStatusWithCQLCredentialsIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	configureManagedClusterCredentials(t, clusterSvc, c)
 
 	testStatusIntegration(t, c.ID, clusterSvc, clusterSvc.GetClusterByID, s, IsSSLEnabled())
 }
@@ -225,9 +229,9 @@ func testStatusIntegration(t *testing.T, clusterID uuid.UUID, clusterSvc cluster
 		TryStartAgent(t, ManagedClusterHosts())
 	}()
 
-	hrt := NewHackableRoundTripper(scyllaclient.DefaultTransport())
+	hrt := NewHackableRoundTripper(managedClusterAgentTransport(t))
 	scyllaClientProvider := func(context.Context, uuid.UUID) (*scyllaclient.Client, error) {
-		sc := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
+		sc := ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken())
 		sc.Timeout = time.Second
 		sc.Transport = hrt
 		return scyllaclient.NewClient(sc, logger.Named("scylla"))
@@ -254,10 +258,25 @@ func testStatusIntegration(t *testing.T, clusterID uuid.UUID, clusterSvc cluster
 		opts := cmp.Options{
 			UUIDComparer(),
 			cmpopts.IgnoreFields(NodeStatus{}, "HostID", "Status", "CQLRtt", "RESTRtt", "AlternatorRtt",
-				"TotalRAM", "Uptime", "CPUCount", "ScyllaVersion", "AgentVersion"),
+				"TotalRAM", "Uptime", "CPUCount", "ScyllaVersion", "AgentVersion", "SSL",
+				"AgentTLSVerified", "CQLTLSVerified", "CQLAuthVerified", "AlternatorTLSVerified", "AlternatorAuthVerified"),
 		}
 		if diff := cmp.Diff(golden, status, opts...); diff != "" {
 			t.Errorf("Status() = %+v, diff %s", status, diff)
+		}
+		for _, got := range status {
+			if got.AgentTLSVerified != (got.RESTStatus == statusUp) {
+				t.Errorf("Agent TLS verified=%v for REST status %s on %s", got.AgentTLSVerified, got.RESTStatus, got.Host)
+			}
+			if got.CQLTLSVerified != (sslEnabled && got.CQLStatus == statusUp) || got.CQLAuthVerified != (got.CQLStatus == statusUp) {
+				t.Errorf("CQL verification flags are not truthful on %s: TLS=%v auth=%v status=%s", got.Host, got.CQLTLSVerified, got.CQLAuthVerified, got.CQLStatus)
+			}
+			if got.AlternatorTLSVerified != (sslEnabled && got.AlternatorStatus == statusUp) || got.AlternatorAuthVerified != (got.AlternatorStatus == statusUp) {
+				t.Errorf("Alternator verification flags are not truthful on %s: TLS=%v auth=%v status=%s", got.Host, got.AlternatorTLSVerified, got.AlternatorAuthVerified, got.AlternatorStatus)
+			}
+			if got.SSL != got.CQLTLSVerified {
+				t.Errorf("legacy SSL status differs from verified CQL TLS on %s", got.Host)
+			}
 		}
 	}
 
@@ -378,7 +397,7 @@ func testStatusIntegration(t *testing.T, clusterID uuid.UUID, clusterSvc cluster
 
 		golden := []NodeStatus{
 			{Datacenter: "dc1", Host: ToCanonicalIP(IPFromTestNet("11")), CQLStatus: "UP", RESTStatus: "UP", AlternatorStatus: "UP", SSL: sslEnabled},
-			{Datacenter: "dc1", Host: ToCanonicalIP(IPFromTestNet("12")), CQLStatus: "UP", RESTStatus: "DOWN", RESTCause: "dial tcp " + URLEncodeIP(ToCanonicalIP(IPFromTestNet("12"))) + ":10001: connect: connection refused", AlternatorStatus: "UP", SSL: sslEnabled},
+			{Datacenter: "dc1", Host: ToCanonicalIP(IPFromTestNet("12")), CQLStatus: "UP", RESTStatus: "DOWN", RESTCause: "Agent REST endpoint is unavailable; see Manager logs with the request trace ID", AlternatorStatus: "UP", SSL: sslEnabled},
 			{Datacenter: "dc1", Host: ToCanonicalIP(IPFromTestNet("13")), CQLStatus: "UP", RESTStatus: "UP", AlternatorStatus: "UP", SSL: sslEnabled},
 			{Datacenter: "dc2", Host: ToCanonicalIP(IPFromTestNet("21")), CQLStatus: "UP", RESTStatus: "UP", AlternatorStatus: "UP", SSL: sslEnabled},
 			{Datacenter: "dc2", Host: ToCanonicalIP(IPFromTestNet("22")), CQLStatus: "UP", RESTStatus: "UP", AlternatorStatus: "UP", SSL: sslEnabled},
@@ -502,10 +521,20 @@ func fakeHealthCheckStatus(host string, code int) http.RoundTripper {
 
 func clusterWithSSL(t *testing.T, cluster *cluster.Cluster, sslEnabled bool) {
 	t.Helper()
+	ca, err := os.ReadFile(ManagedClusterCAFile())
+	if err != nil {
+		t.Fatalf("read managed cluster CA: %v", err)
+	}
+	cluster.AgentCAFile = ca
+	cluster.AgentServerName = ManagedClusterTLSServerName()
 	if !sslEnabled {
 		return
 	}
 	sslOpts := CQLSSLOptions()
+	cluster.CQLCAFile = ca
+	cluster.CQLServerName = ManagedClusterTLSServerName()
+	cluster.AlternatorCAFile = ca
+	cluster.AlternatorServerName = ManagedClusterTLSServerName()
 	userKey, err := os.ReadFile(sslOpts.KeyPath)
 	if err != nil {
 		t.Fatalf("read file (%s) err: %v", sslOpts.KeyPath, err)
@@ -516,4 +545,54 @@ func clusterWithSSL(t *testing.T, cluster *cluster.Cluster, sslEnabled bool) {
 	}
 	cluster.SSLUserKeyFile = userKey
 	cluster.SSLUserCertFile = userCrt
+	populateManagedClusterCredentials(t, cluster)
+}
+
+func populateManagedClusterCredentials(t *testing.T, c *cluster.Cluster) {
+	t.Helper()
+	config := ManagedClusterAgentConfig(t, ManagedClusterHosts(), c.AuthToken)
+	config.Transport = managedClusterAgentTransport(t)
+	client, err := scyllaclient.NewClient(config, log.NewDevelopment())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	session := CreateManagedClusterSession(t, false, client, "", "")
+	defer session.Close()
+	c.Username, c.Password = ManagedClusterCredentials()
+	c.AlternatorAccessKeyID, c.AlternatorSecretAccessKey = GetAlternatorCreds(t, session, "")
+}
+
+func managedClusterAgentTransport(t *testing.T) *http.Transport {
+	t.Helper()
+	ca, err := os.ReadFile(ManagedClusterCAFile())
+	if err != nil {
+		t.Fatalf("read managed cluster CA: %v", err)
+	}
+	trust := secrets.NewAgentTLSTrust(uuid.Nil)
+	trust.CA = ca
+	trust.ServerName = ManagedClusterTLSServerName()
+	tlsConfig, err := secrets.TLSConfig(trust)
+	if err != nil {
+		t.Fatalf("build managed cluster Agent TLS config: %v", err)
+	}
+	transport := scyllaclient.DefaultTransport()
+	transport.TLSClientConfig = tlsConfig
+	return transport
+}
+
+func configureManagedClusterCredentials(t *testing.T, service *cluster.Service, c *cluster.Cluster) {
+	t.Helper()
+	client, err := service.CreateClientNoCache(context.Background(), c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	session := CreateManagedClusterSession(t, false, client, "", "")
+	defer session.Close()
+	c.Username, c.Password = ManagedClusterCredentials()
+	c.AlternatorAccessKeyID, c.AlternatorSecretAccessKey = GetAlternatorCreds(t, session, "")
+	if err := service.PutCluster(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
 }

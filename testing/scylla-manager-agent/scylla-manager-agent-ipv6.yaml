@@ -1,4 +1,6 @@
 auth_token: token
+tls_cert_file: /etc/scylla/certs/db.crt
+tls_key_file: /etc/scylla/certs/db.key
 
 cpu: 0
 

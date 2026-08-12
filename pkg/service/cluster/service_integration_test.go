@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,6 +50,7 @@ func TestValidateHostConnectivityIntegration(t *testing.T) {
 			Host:      ManagedClusterHost(),
 		}
 	)
+	secureManagedCluster(t, c)
 	s, err := cluster.NewService(session, metrics.NewClusterMetrics(), secretsStore, scyllaclient.DefaultTimeoutConfig(),
 		server.DefaultConfig().ClientCacheTimeout, log.NewDevelopment())
 	if err != nil {
@@ -175,6 +177,7 @@ func TestClientIntegration(t *testing.T) {
 		AuthToken: "token",
 		Host:      ManagedClusterHost(),
 	}
+	secureManagedCluster(t, c)
 	err = s.PutCluster(context.Background(), c)
 	if err != nil {
 		t.Fatal(err)
@@ -244,6 +247,7 @@ func TestAlternatorClientIntegration(t *testing.T) {
 		AuthToken: "token",
 		Host:      ManagedClusterHost(),
 	}
+	secureManagedCluster(t, c)
 	if err = s.PutCluster(context.Background(), c); err != nil {
 		t.Fatal(err)
 	}
@@ -313,8 +317,8 @@ func TestServiceStorageIntegration(t *testing.T) {
 
 	diffOpts := cmp.Options{
 		UUIDComparer(),
-		cmpopts.IgnoreFields(cluster.Cluster{}, "Host"),
-		cmpopts.IgnoreFields(cluster.Cluster{}, "KnownHosts"),
+		cmpopts.IgnoreFields(cluster.Cluster{}, "Host", "KnownHosts",
+			"CQLCAFile", "CQLServerName", "AlternatorCAFile", "AlternatorServerName", "AgentCAFile", "AgentServerName"),
 		cmpopts.SortSlices(func(a, b *cluster.Cluster) bool {
 			return a.ID.String() < b.ID.String()
 		}),
@@ -343,6 +347,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 				Host:      ManagedClusterHost(),
 				AuthToken: AgentAuthToken(),
 			}
+			secureManagedCluster(t, c)
 			if err := s.PutCluster(ctx, c); err != nil {
 				t.Fatal(err)
 			}
@@ -374,7 +379,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("get cluster", func(t *testing.T) {
 		setup(t)
 
-		c0 := validCluster()
+		c0 := validCluster(t)
 		c0.ID = uuid.Nil
 
 		if err := s.PutCluster(ctx, c0); err != nil {
@@ -403,7 +408,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("get cluster name", func(t *testing.T) {
 		setup(t)
 
-		c := validCluster()
+		c := validCluster(t)
 		if err := s.PutCluster(ctx, c); err != nil {
 			t.Fatal(err)
 		}
@@ -429,7 +434,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("put conflicting cluster name", func(t *testing.T) {
 		setup(t)
 
-		c0 := validCluster()
+		c0 := validCluster(t)
 
 		if err := s.PutCluster(ctx, c0); err != nil {
 			t.Fatal(err)
@@ -448,7 +453,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("put cluster with wrong auth token", func(t *testing.T) {
 		setup(t)
 
-		c := validCluster()
+		c := validCluster(t)
 		c.AuthToken = "foobar"
 
 		if err := s.PutCluster(ctx, c); err == nil {
@@ -461,7 +466,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("put new cluster", func(t *testing.T) {
 		setup(t)
 
-		c := validCluster()
+		c := validCluster(t)
 		c.ID = uuid.Nil
 
 		if err := s.PutCluster(ctx, c); err != nil {
@@ -515,7 +520,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("put new cluster with secrets", func(t *testing.T) {
 		setup(t)
 
-		c := tlsCluster()
+		c := tlsCluster(t)
 		c.ID = uuid.Nil
 
 		if err := s.PutCluster(ctx, c); err != nil {
@@ -528,7 +533,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("update cluster with secrets", func(t *testing.T) {
 		setup(t)
 
-		c := tlsCluster()
+		c := tlsCluster(t)
 		c.ID = uuid.Nil
 
 		if err := s.PutCluster(ctx, c); err != nil {
@@ -553,7 +558,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("check existing CQL credentials", func(t *testing.T) {
 		setup(t)
 
-		c := tlsCluster()
+		c := tlsCluster(t)
 		c.ID = uuid.Nil
 
 		if err := s.PutCluster(ctx, c); err != nil {
@@ -571,12 +576,13 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("check non-existing CQL credentials", func(t *testing.T) {
 		setup(t)
 
-		c := tlsCluster()
+		c := tlsCluster(t)
 		c.ID = uuid.Nil
-		c.Username = ""
-		c.Password = ""
 
 		if err := s.PutCluster(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeleteCQLCredentials(ctx, c.ID); err != nil {
 			t.Fatal(err)
 		}
 		ok, err := s.CheckCQLCredentials(c.ID)
@@ -591,7 +597,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("check existing alternator credentials", func(t *testing.T) {
 		setup(t)
 
-		c := tlsCluster()
+		c := tlsCluster(t)
 		c.ID = uuid.Nil
 
 		if err := s.PutCluster(ctx, c); err != nil {
@@ -609,12 +615,13 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("check non-existing alternator credentials", func(t *testing.T) {
 		setup(t)
 
-		c := tlsCluster()
+		c := tlsCluster(t)
 		c.ID = uuid.Nil
-		c.AlternatorAccessKeyID = ""
-		c.AlternatorSecretAccessKey = ""
 
 		if err := s.PutCluster(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeleteAlternatorCredentials(ctx, c.ID); err != nil {
 			t.Fatal(err)
 		}
 		ok, err := s.CheckAlternatorCredentials(c.ID)
@@ -629,7 +636,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("delete cluster removes secrets", func(t *testing.T) {
 		setup(t)
 
-		c := tlsCluster()
+		c := tlsCluster(t)
 		c.ID = uuid.Nil
 
 		if err := s.PutCluster(ctx, c); err != nil {
@@ -662,7 +669,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("delete CQL credentials", func(t *testing.T) {
 		setup(t)
 
-		c := tlsCluster()
+		c := tlsCluster(t)
 		c.ID = uuid.Nil
 
 		if err := s.PutCluster(ctx, c); err != nil {
@@ -683,7 +690,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("delete alternator credentials", func(t *testing.T) {
 		setup(t)
 
-		c := tlsCluster()
+		c := tlsCluster(t)
 		c.ID = uuid.Nil
 
 		if err := s.PutCluster(ctx, c); err != nil {
@@ -704,7 +711,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("delete SSL cert", func(t *testing.T) {
 		setup(t)
 
-		c := tlsCluster()
+		c := tlsCluster(t)
 		c.ID = uuid.Nil
 
 		if err := s.PutCluster(ctx, c); err != nil {
@@ -725,7 +732,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("put new cluster without automatic repair", func(t *testing.T) {
 		setup(t)
 
-		c := validCluster()
+		c := validCluster(t)
 		c.ID = uuid.Nil
 		c.WithoutRepair = true
 
@@ -740,7 +747,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("put existing cluster", func(t *testing.T) {
 		setup(t)
 
-		c := validCluster()
+		c := validCluster(t)
 		// Given cluster
 		if err := s.PutCluster(ctx, c); err != nil {
 			t.Fatal(err)
@@ -778,7 +785,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 	t.Run("delete cluster", func(t *testing.T) {
 		setup(t)
 
-		c := validCluster()
+		c := validCluster(t)
 		if err := s.PutCluster(ctx, c); err != nil {
 			t.Fatal(err)
 		}
@@ -809,7 +816,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 		h1 := hosts[0]
 		h2 := hosts[1]
 
-		c := validCluster()
+		c := validCluster(t)
 		c.Host = h1
 		if err := RunIptablesCommand(t, h2, CmdBlockScyllaREST); err != nil {
 			t.Fatal(err)
@@ -847,7 +854,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 		setup(t)
 		hosts := ManagedClusterHosts()
 		clusterHost := hosts[0]
-		initialCluster := *validCluster()
+		initialCluster := *validCluster(t)
 		initialCluster.Host = clusterHost
 		Print("Create initial cluster with host: " + clusterHost)
 		if err = s.PutCluster(ctx, &initialCluster); err != nil {
@@ -869,7 +876,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 		defer RunIptablesCommand(t, clusterHost, CmdUnblockScyllaREST)
 
 		Print("Expect connectivity failure when adding new cluster")
-		putCluster := *validCluster()
+		putCluster := *validCluster(t)
 		putCluster.Host = clusterHost
 		// Simulate missing known hosts and expect that
 		// they won't overwrite existing known hosts.
@@ -916,7 +923,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 
 	t.Run("no --host in SM DB", func(t *testing.T) {
 		setup(t)
-		c := validCluster()
+		c := validCluster(t)
 		if err := s.PutCluster(ctx, c); err != nil {
 			t.Fatal(err)
 		}
@@ -945,6 +952,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 			Host:      ManagedClusterHost(),
 			AuthToken: AgentAuthToken(),
 		}
+		secureManagedCluster(t, c)
 		if err := s.PutCluster(ctx, c); err != nil {
 			t.Fatal(err)
 		}
@@ -1019,14 +1027,63 @@ func TestServiceStorageIntegration(t *testing.T) {
 	})
 }
 
-func validCluster() *cluster.Cluster {
-	return &cluster.Cluster{
+func validCluster(t *testing.T) *cluster.Cluster {
+	c := &cluster.Cluster{
 		ID:        uuid.MustRandom(),
 		Name:      "name_" + uuid.MustRandom().String(),
 		Host:      ManagedClusterHost(),
 		Port:      10001,
 		AuthToken: AgentAuthToken(),
 	}
+	secureManagedCluster(t, c)
+	return c
+}
+
+func secureManagedCluster(t *testing.T, c *cluster.Cluster) {
+	t.Helper()
+	ca, err := os.ReadFile(ManagedClusterCAFile())
+	if err != nil {
+		t.Fatalf("read managed cluster CA: %v", err)
+	}
+	serverName := ManagedClusterTLSServerName()
+	c.AgentCAFile, c.AgentServerName = ca, serverName
+	c.CQLCAFile, c.CQLServerName = ca, serverName
+	c.AlternatorCAFile, c.AlternatorServerName = ca, serverName
+	if IsSSLEnabled() {
+		c.Username, c.Password = ManagedClusterCredentials()
+		c.AlternatorAccessKeyID, c.AlternatorSecretAccessKey = managedClusterAlternatorCredentials(t, ca, serverName)
+	}
+}
+
+var (
+	managedClusterAlternatorCredentialsOnce sync.Once
+	managedClusterAlternatorAccessKeyID     string
+	managedClusterAlternatorSecretAccessKey string
+)
+
+func managedClusterAlternatorCredentials(t *testing.T, ca []byte, serverName string) (string, string) {
+	t.Helper()
+	managedClusterAlternatorCredentialsOnce.Do(func() {
+		trust := secrets.NewAgentTLSTrust(uuid.Nil)
+		trust.CA, trust.ServerName = ca, serverName
+		tlsConfig, err := secrets.TLSConfig(trust)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transport := scyllaclient.DefaultTransport()
+		transport.TLSClientConfig = tlsConfig
+		config := ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken())
+		config.Transport = transport
+		client, err := scyllaclient.NewClient(config, log.NewDevelopment())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		session := CreateManagedClusterSession(t, false, client, "", "")
+		defer session.Close()
+		managedClusterAlternatorAccessKeyID, managedClusterAlternatorSecretAccessKey = GetAlternatorCreds(t, session, "")
+	})
+	return managedClusterAlternatorAccessKeyID, managedClusterAlternatorSecretAccessKey
 }
 
 var (
@@ -1046,12 +1103,14 @@ func init() {
 	}
 }
 
-func tlsCluster() *cluster.Cluster {
-	c := validCluster()
-	c.Username = "user"
-	c.Password = "password"
-	c.AlternatorAccessKeyID = "id"
-	c.AlternatorSecretAccessKey = "key"
+func tlsCluster(t *testing.T) *cluster.Cluster {
+	c := validCluster(t)
+	if c.Username == "" {
+		c.Username, c.Password = "user", "password"
+	}
+	if c.AlternatorAccessKeyID == "" {
+		c.AlternatorAccessKeyID, c.AlternatorSecretAccessKey = "id", "key"
+	}
 	c.SSLUserCertFile = tlsCert
 	c.SSLUserKeyFile = tlsKey
 	return c

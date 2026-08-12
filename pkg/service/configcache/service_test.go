@@ -41,11 +41,11 @@ func TestService_Read(t *testing.T) {
 	host1ID := "host1"
 	initialState := convertMapToSyncMap(
 		map[any]any{
-			cluster1UUID.String(): convertMapToSyncMap(
+			cluster1UUID.String(): &clusterConfigEntry{configs: convertMapToSyncMap(
 				map[any]any{
 					host1ID: host1NodeConfig,
 				},
-			),
+			)},
 		},
 	)
 
@@ -90,6 +90,7 @@ func TestService_Read(t *testing.T) {
 				scyllaClient: mockProviderFunc,
 				secretsStore: &mockStore{},
 				configs:      tc.state,
+				revisions:    &sync.Map{},
 			}
 
 			// When
@@ -121,11 +122,11 @@ func TestService_AvailableHosts(t *testing.T) {
 	host1ID := "host1"
 	initialState := convertMapToSyncMap(
 		map[any]any{
-			cluster1UUID.String(): convertMapToSyncMap(
+			cluster1UUID.String(): &clusterConfigEntry{configs: convertMapToSyncMap(
 				map[any]any{
 					host1ID: host1NodeConfig,
 				},
-			),
+			)},
 		},
 	)
 
@@ -159,6 +160,7 @@ func TestService_AvailableHosts(t *testing.T) {
 				scyllaClient: mockProviderFunc,
 				secretsStore: &mockStore{},
 				configs:      tc.state,
+				revisions:    &sync.Map{},
 			}
 
 			// When
@@ -188,6 +190,7 @@ func TestService_Run(t *testing.T) {
 			scyllaClient: mockProviderFunc,
 			secretsStore: &mockStore{},
 			configs:      &sync.Map{},
+			revisions:    &sync.Map{},
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -208,19 +211,183 @@ func TestService_Run(t *testing.T) {
 
 func TestServiceForceUpdateCluster(t *testing.T) {
 	t.Run("validate no panic when updating non-existing cluster", func(t *testing.T) {
+		clusterID := uuid.MustRandom()
 		svc := Service{
 			svcConfig:    DefaultConfig(),
 			clusterSvc:   &mockErrorClusterSvc{},
 			scyllaClient: mockProviderFunc,
 			secretsStore: &mockStore{},
-			configs:      &sync.Map{},
-			logger:       log.NewDevelopment(),
+			configs: convertMapToSyncMap(map[any]any{
+				clusterID.String(): &clusterConfigEntry{configs: convertMapToSyncMap(map[any]any{"host": NodeConfig{}})},
+			}),
+			revisions: &sync.Map{},
+			logger:    log.NewDevelopment(),
 		}
 
-		if svc.ForceUpdateCluster(context.Background(), uuid.MustRandom()) {
+		if svc.ForceUpdateCluster(context.Background(), clusterID) {
 			t.Fatalf("Expected updating non-existing cluster config to fail")
 		}
+		if _, err := svc.Read(clusterID, "host"); err != ErrNoClusterConfig {
+			t.Fatalf("failed refresh retained stale cluster config: %v", err)
+		}
 	})
+}
+
+func TestServiceRefreshPublishesAtomically(t *testing.T) {
+	clusterID := uuid.MustRandom()
+	c := &cluster.Cluster{ID: clusterID, Name: "current"}
+	clusterSvc := &rotatingClusterServicer{current: c}
+	svc := Service{
+		svcConfig:    DefaultConfig(),
+		clusterSvc:   clusterSvc,
+		scyllaClient: noRequestProvider("good", "bad"),
+		secretsStore: &mockStore{},
+		configs: convertMapToSyncMap(map[any]any{
+			clusterID.String(): &clusterConfigEntry{configs: convertMapToSyncMap(map[any]any{"stale": NodeConfig{}})},
+		}),
+		revisions: &sync.Map{},
+		logger:    log.NewDevelopment(),
+		nodeConfigLoader: func(_ context.Context, host string, _ *scyllaclient.Client, _ *cluster.Cluster) (NodeConfig, error) {
+			if host == "bad" {
+				return NodeConfig{}, errors.New("host refresh failed")
+			}
+			return NodeConfig{NodeInfo: &scyllaclient.NodeInfo{AgentVersion: "new"}}, nil
+		},
+	}
+
+	if svc.ForceUpdateCluster(context.Background(), clusterID) {
+		t.Fatal("partial host refresh unexpectedly succeeded")
+	}
+	if _, err := svc.ReadAll(clusterID); err != ErrNoClusterConfig {
+		t.Fatalf("partial refresh published or retained cluster config: %v", err)
+	}
+}
+
+func TestServiceSupersededRefreshCannotRepublishOldConfig(t *testing.T) {
+	clusterID := uuid.MustRandom()
+	oldCluster := &cluster.Cluster{ID: clusterID, Name: "old"}
+	newCluster := &cluster.Cluster{ID: clusterID, Name: "new"}
+	clusterSvc := &rotatingClusterServicer{current: oldCluster}
+	oldStarted := make(chan struct{})
+	releaseOld := make(chan struct{})
+	svc := Service{
+		svcConfig:    DefaultConfig(),
+		clusterSvc:   clusterSvc,
+		scyllaClient: noRequestProvider("host"),
+		secretsStore: &mockStore{},
+		configs:      &sync.Map{},
+		revisions:    &sync.Map{},
+		logger:       log.NewDevelopment(),
+		nodeConfigLoader: func(_ context.Context, _ string, _ *scyllaclient.Client, c *cluster.Cluster) (NodeConfig, error) {
+			if c.Name == "old" {
+				close(oldStarted)
+				<-releaseOld
+			}
+			return NodeConfig{NodeInfo: &scyllaclient.NodeInfo{AgentVersion: c.Name}}, nil
+		},
+	}
+
+	oldResult := make(chan bool, 1)
+	go func() {
+		oldResult <- svc.ForceUpdateCluster(context.Background(), clusterID)
+	}()
+	<-oldStarted
+	clusterSvc.setCurrent(newCluster)
+	if !svc.ForceUpdateCluster(context.Background(), clusterID) {
+		t.Fatal("new refresh failed")
+	}
+	close(releaseOld)
+	if <-oldResult {
+		t.Fatal("superseded refresh reported success")
+	}
+
+	got, err := svc.Read(clusterID, "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AgentVersion != "new" {
+		t.Fatalf("superseded refresh republished stale config: %q", got.AgentVersion)
+	}
+}
+
+func TestServiceOlderInvalidationCannotDeleteNewerConfig(t *testing.T) {
+	clusterID := uuid.MustRandom()
+	newConfig := &clusterConfigEntry{
+		revision: 2,
+		configs: convertMapToSyncMap(map[any]any{
+			"host": NodeConfig{NodeInfo: &scyllaclient.NodeInfo{AgentVersion: "new"}},
+		}),
+	}
+	svc := Service{configs: &sync.Map{}, revisions: &sync.Map{}}
+	svc.configs.Store(clusterID.String(), newConfig)
+
+	svc.invalidateOlderConfig(clusterID, 1)
+	raw, ok := svc.configs.Load(clusterID.String())
+	if !ok || raw != newConfig {
+		t.Fatal("older refresh invalidation deleted newer published config")
+	}
+}
+
+func TestServiceInitInvalidatesInflightRefresh(t *testing.T) {
+	clusterID := uuid.MustRandom()
+	c := &cluster.Cluster{ID: clusterID, Name: "old"}
+	clusterSvc := &rotatingClusterServicer{current: c}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	svc := Service{
+		svcConfig:    DefaultConfig(),
+		clusterSvc:   clusterSvc,
+		scyllaClient: noRequestProvider("host"),
+		secretsStore: &mockStore{},
+		configs:      &sync.Map{},
+		revisions:    &sync.Map{},
+		logger:       log.NewDevelopment(),
+		nodeConfigLoader: func(context.Context, string, *scyllaclient.Client, *cluster.Cluster) (NodeConfig, error) {
+			close(started)
+			<-release
+			return NodeConfig{NodeInfo: &scyllaclient.NodeInfo{AgentVersion: "old"}}, nil
+		},
+	}
+
+	result := make(chan bool, 1)
+	go func() { result <- svc.ForceUpdateCluster(context.Background(), clusterID) }()
+	<-started
+	svc.Init(context.Background())
+	close(release)
+	if <-result {
+		t.Fatal("pre-Init refresh reported success")
+	}
+	if _, err := svc.ReadAll(clusterID); err != ErrNoClusterConfig {
+		t.Fatalf("pre-Init refresh published into reset cache: %v", err)
+	}
+}
+
+func TestServiceUpdateAllRefetchesCurrentCluster(t *testing.T) {
+	clusterID := uuid.MustRandom()
+	oldCluster := &cluster.Cluster{ID: clusterID, Name: "old"}
+	newCluster := &cluster.Cluster{ID: clusterID, Name: "new"}
+	clusterSvc := &rotatingClusterServicer{current: newCluster, listed: []*cluster.Cluster{oldCluster}}
+	svc := Service{
+		svcConfig:    DefaultConfig(),
+		clusterSvc:   clusterSvc,
+		scyllaClient: noRequestProvider("host"),
+		secretsStore: &mockStore{},
+		configs:      &sync.Map{},
+		revisions:    &sync.Map{},
+		logger:       log.NewDevelopment(),
+		nodeConfigLoader: func(_ context.Context, _ string, _ *scyllaclient.Client, c *cluster.Cluster) (NodeConfig, error) {
+			return NodeConfig{NodeInfo: &scyllaclient.NodeInfo{AgentVersion: c.Name}}, nil
+		},
+	}
+
+	svc.updateAll(context.Background())
+	got, err := svc.Read(clusterID, "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AgentVersion != "new" {
+		t.Fatalf("background refresh used stale listed cluster: %q", got.AgentVersion)
+	}
 }
 
 func TestService_Read_IPv6Normalization(t *testing.T) {
@@ -246,9 +413,9 @@ func TestService_Read_IPv6Normalization(t *testing.T) {
 	clusterID := uuid.MustRandom()
 	// Prepopulate the service config with the canonical representation as the key.
 	initialState := convertMapToSyncMap(map[any]any{
-		clusterID.String(): convertMapToSyncMap(map[any]any{
+		clusterID.String(): &clusterConfigEntry{configs: convertMapToSyncMap(map[any]any{
 			parsedKey.String(): nodeConfig,
-		}),
+		})},
 	})
 
 	// Define several valid IPv6 representations for the same host.
@@ -269,6 +436,7 @@ func TestService_Read_IPv6Normalization(t *testing.T) {
 		scyllaClient: mockProviderFunc,
 		secretsStore: &mockStore{},
 		configs:      initialState,
+		revisions:    &sync.Map{},
 	}
 
 	for _, tc := range testCases {
@@ -338,6 +506,20 @@ func (s *mockClusterServicer) CheckCQLCredentials(id uuid.UUID) (bool, error) {
 	return false, nil
 }
 
+func (s *mockClusterServicer) CheckAlternatorCredentials(id uuid.UUID) (bool, error) {
+	return false, nil
+}
+func (s *mockClusterServicer) DeleteAlternatorCredentials(ctx context.Context, id uuid.UUID) error {
+	return nil
+}
+func (s *mockClusterServicer) CheckSSLUserCert(id uuid.UUID) (bool, error) { return false, nil }
+func (s *mockClusterServicer) CheckTLSTrust(id uuid.UUID, protocol string) (bool, error) {
+	return false, nil
+}
+func (s *mockClusterServicer) DeleteTLSTrust(ctx context.Context, id uuid.UUID, protocol string) error {
+	return nil
+}
+
 // DeleteCQLCredentials mocks the DeleteCQLCredentials method of Servicer.
 func (s *mockClusterServicer) DeleteCQLCredentials(ctx context.Context, id uuid.UUID) error {
 	return nil
@@ -395,4 +577,38 @@ type mockErrorClusterSvc struct {
 // GetCluster mocks the GetCluster method of Servicer with error response.
 func (s *mockErrorClusterSvc) GetCluster(_ context.Context, _ string) (*cluster.Cluster, error) {
 	return nil, errors.New("not found")
+}
+
+type rotatingClusterServicer struct {
+	mockClusterServicer
+
+	mu      sync.RWMutex
+	current *cluster.Cluster
+	listed  []*cluster.Cluster
+}
+
+func (s *rotatingClusterServicer) GetCluster(context.Context, string) (*cluster.Cluster, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	c := *s.current
+	return &c, nil
+}
+
+func (s *rotatingClusterServicer) ListClusters(context.Context, *cluster.Filter) ([]*cluster.Cluster, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]*cluster.Cluster(nil), s.listed...), nil
+}
+
+func (s *rotatingClusterServicer) setCurrent(c *cluster.Cluster) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.current = c
+}
+
+func noRequestProvider(hosts ...string) scyllaclient.ProviderFunc {
+	return func(context.Context, uuid.UUID) (*scyllaclient.Client, error) {
+		config := scyllaclient.TestConfig(hosts, "token")
+		return scyllaclient.NewClient(config, log.NewDevelopment())
+	}
 }

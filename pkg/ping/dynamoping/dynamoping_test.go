@@ -5,9 +5,13 @@ package dynamoping
 import (
 	"context"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/scylladb/scylla-manager/v3/pkg/ping"
 )
 
@@ -68,6 +72,42 @@ func TestPingTimeout(t *testing.T) {
 			t.Errorf("QueryPing() not within expected time margin %v got %v", config.Timeout, d)
 		}
 	})
+}
+
+func TestAuthenticatedQueryPingIsSigned(t *testing.T) {
+	var authorization string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		_, _ = w.Write([]byte(`{"Count":0,"Items":[],"ScannedCount":0}`))
+	}))
+	defer server.Close()
+
+	config := Config{
+		Addr:                   server.URL,
+		Timeout:                time.Second,
+		RequiresAuthentication: true,
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "test-access", SecretAccessKey: "test-secret"}, nil
+		}),
+	}
+	if _, err := QueryPing(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(authorization, "AWS4-HMAC-SHA256 ") {
+		t.Fatalf("query was not SigV4 signed: %q", authorization)
+	}
+}
+
+func TestAuthenticatedQueryPingRequiresCredentials(t *testing.T) {
+	_, err := QueryPing(context.Background(), Config{
+		Addr:                   "http://127.0.0.1",
+		Timeout:                time.Second,
+		RequiresAuthentication: true,
+	})
+	if err != ErrAlternatorQueryPingNotSupported {
+		t.Fatalf("expected missing credentials error, got %v", err)
+	}
 }
 
 func epsilonRange(d time.Duration) (time.Duration, time.Duration) {

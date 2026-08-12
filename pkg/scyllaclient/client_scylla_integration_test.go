@@ -27,7 +27,7 @@ import (
 )
 
 func TestClientAuthIntegration(t *testing.T) {
-	client, err := scyllaclient.NewClient(scyllaclient.TestConfig(ManagedClusterHosts(), "wrong auth token"), log.NewDevelopment())
+	client, err := scyllaclient.NewClient(ManagedClusterAgentConfig(t, ManagedClusterHosts(), "wrong auth token"), log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func TestClientAuthIntegration(t *testing.T) {
 }
 
 func TestClientStatusIntegration(t *testing.T) {
-	client, err := scyllaclient.NewClient(scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
+	client, err := scyllaclient.NewClient(ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestClientDescribeRingIntegration(t *testing.T) {
 		},
 	}
 
-	client, err := scyllaclient.NewClient(scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
+	client, err := scyllaclient.NewClient(ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestClientDescribeRingIntegration(t *testing.T) {
 }
 
 func TestClientActiveRepairsIntegration(t *testing.T) {
-	client, err := scyllaclient.NewClient(scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
+	client, err := scyllaclient.NewClient(ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +247,7 @@ func TestClientActiveRepairsIntegration(t *testing.T) {
 }
 
 func TestClientSnapshotIntegration(t *testing.T) {
-	config := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
+	config := ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken())
 	client, err := scyllaclient.NewClient(config, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -346,7 +346,7 @@ func TestClientTableExistsIntegration(t *testing.T) {
 		},
 	}
 
-	client, err := scyllaclient.NewClient(scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
+	client, err := scyllaclient.NewClient(ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +367,7 @@ func TestClientTableExistsIntegration(t *testing.T) {
 }
 
 func TestClientTokensIntegration(t *testing.T) {
-	config := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
+	config := ManagedClusterAgentConfig(t, ManagedClusterHosts(), AgentAuthToken())
 	client, err := scyllaclient.NewClient(config, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)

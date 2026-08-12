@@ -16,12 +16,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rclone/rclone/fs"
 	"github.com/scylladb/go-log"
-	"github.com/scylladb/go-set/strset"
 	"github.com/scylladb/scylla-manager/v3/pkg"
 	"github.com/scylladb/scylla-manager/v3/pkg/config/agent"
 	"github.com/scylladb/scylla-manager/v3/pkg/rclone"
 	"github.com/scylladb/scylla-manager/v3/pkg/rclone/rcserver"
-	"github.com/scylladb/scylla-manager/v3/pkg/util/certutil"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/cpuset"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/httppprof"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/netwait"
@@ -183,26 +181,11 @@ func (s *server) makeServers(ctx context.Context) error {
 }
 
 func (s *server) tlsConfig(ctx context.Context) (*tls.Config, error) {
-	var (
-		cert tls.Certificate
-		err  error
+	s.logger.Info(ctx, "Loading TLS certificate from disk",
+		"cert_file", s.config.TLSCertFile,
+		"key_file", s.config.TLSKeyFile,
 	)
-	if s.config.HasTLSCert() {
-		s.logger.Info(ctx, "Loading TLS certificate from disk",
-			"cert_file", s.config.TLSCertFile,
-			"key_file", s.config.TLSKeyFile,
-		)
-		cert, err = tls.LoadX509KeyPair(s.config.TLSCertFile, s.config.TLSKeyFile)
-	} else {
-		hosts := strset.New()
-		for _, h := range []string{s.config.Scylla.BroadcastRPCAddress, s.config.Scylla.RPCAddress, s.config.Scylla.ListenAddress} {
-			if h != "" && h != net.IPv4zero.String() && h != net.IPv4zero.String() {
-				hosts.Add(h)
-			}
-		}
-		s.logger.Info(ctx, "Generating TLS certificate", "hosts", hosts.List())
-		cert, err = certutil.GenerateSelfSignedCertificate(hosts.List())
-	}
+	cert, err := tls.LoadX509KeyPair(s.config.TLSCertFile, s.config.TLSKeyFile)
 	if err != nil {
 		return nil, errors.Wrap(err, "certificate")
 	}

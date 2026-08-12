@@ -36,7 +36,7 @@ type testHelper struct {
 }
 
 func newTestHelper(t *testing.T, hosts []string) *testHelper {
-	clientCfg := scyllaclient.TestConfig(hosts, AgentAuthToken())
+	clientCfg := ManagedClusterAgentConfig(t, hosts, AgentAuthToken())
 	sc, err := scyllaclient.NewClient(clientCfg, log.NopLogger)
 	if err != nil {
 		t.Fatalf("Unexpected err: %v", err)

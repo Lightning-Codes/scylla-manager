@@ -20,8 +20,9 @@ SCYLLA_VERSION?=scylla:latest
 IP_FAMILY?=IPV4
 RAFT_SCHEMA?=none
 TABLETS?=enabled
-# if true starts the scylla cluster with ssl only config
-SSL_ENABLED?=false
+# Secure fork default: authenticated managed-cluster fixtures run TLS-only.
+# Explicit SSL_ENABLED=false remains an unauthenticated legacy-plaintext case.
+SSL_ENABLED?=true
 
 MANAGER_CONFIG := testing/scylla-manager/scylla-manager.yaml
 PUBLIC_NET := 192.168.200.

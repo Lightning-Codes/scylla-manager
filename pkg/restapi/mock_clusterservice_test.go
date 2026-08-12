@@ -66,6 +66,36 @@ func (mr *MockClusterServiceMockRecorder) CheckCQLCredentials(arg0 interface{}) 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CheckCQLCredentials", reflect.TypeOf((*MockClusterService)(nil).CheckCQLCredentials), arg0)
 }
 
+// CheckSSLUserCert mocks base method.
+func (m *MockClusterService) CheckSSLUserCert(arg0 uuid.UUID) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CheckSSLUserCert", arg0)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CheckSSLUserCert indicates an expected call.
+func (mr *MockClusterServiceMockRecorder) CheckSSLUserCert(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CheckSSLUserCert", reflect.TypeOf((*MockClusterService)(nil).CheckSSLUserCert), arg0)
+}
+
+// CheckTLSTrust mocks base method.
+func (m *MockClusterService) CheckTLSTrust(arg0 uuid.UUID, arg1 string) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CheckTLSTrust", arg0, arg1)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CheckTLSTrust indicates an expected call.
+func (mr *MockClusterServiceMockRecorder) CheckTLSTrust(arg0, arg1 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CheckTLSTrust", reflect.TypeOf((*MockClusterService)(nil).CheckTLSTrust), arg0, arg1)
+}
+
 // DeleteAlternatorCredentials mocks base method.
 func (m *MockClusterService) DeleteAlternatorCredentials(arg0 context.Context, arg1 uuid.UUID) error {
 	m.ctrl.T.Helper()
@@ -120,6 +150,20 @@ func (m *MockClusterService) DeleteSSLUserCert(arg0 context.Context, arg1 uuid.U
 func (mr *MockClusterServiceMockRecorder) DeleteSSLUserCert(arg0, arg1 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteSSLUserCert", reflect.TypeOf((*MockClusterService)(nil).DeleteSSLUserCert), arg0, arg1)
+}
+
+// DeleteTLSTrust mocks base method.
+func (m *MockClusterService) DeleteTLSTrust(arg0 context.Context, arg1 uuid.UUID, arg2 string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeleteTLSTrust", arg0, arg1, arg2)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// DeleteTLSTrust indicates an expected call.
+func (mr *MockClusterServiceMockRecorder) DeleteTLSTrust(arg0, arg1, arg2 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteTLSTrust", reflect.TypeOf((*MockClusterService)(nil).DeleteTLSTrust), arg0, arg1, arg2)
 }
 
 // GetCluster mocks base method.

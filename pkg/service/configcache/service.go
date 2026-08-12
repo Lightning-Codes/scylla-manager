@@ -6,6 +6,7 @@ import (
 	"context"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -54,7 +55,20 @@ type Service struct {
 	secretsStore store.Store
 
 	configs *sync.Map
-	logger  log.Logger
+	// revisions contains a monotonically increasing generation per cluster. It
+	// prevents a slower refresh that started with old trust from publishing
+	// after a newer rotation or deletion refresh.
+	revisions *sync.Map
+	logger    log.Logger
+
+	// nodeConfigLoader is a test seam for exercising refresh publication races
+	// without issuing Agent requests. Production always uses retrieveNodeConfig.
+	nodeConfigLoader func(context.Context, string, *scyllaclient.Client, *cluster.Cluster) (NodeConfig, error)
+}
+
+type clusterConfigEntry struct {
+	revision uint64
+	configs  *sync.Map
 }
 
 // NewService is the constructor for the cluster config cache service.
@@ -65,12 +79,23 @@ func NewService(config Config, clusterSvc cluster.Servicer, client scyllaclient.
 		scyllaClient: client,
 		secretsStore: secretsStore,
 		configs:      &sync.Map{},
+		revisions:    &sync.Map{},
 		logger:       logger,
 	}
 }
 
 func (svc *Service) Init(ctx context.Context) {
-	svc.configs = &sync.Map{}
+	// Invalidate every in-flight refresh without resetting generation numbers.
+	// Resetting generations could let a pre-Init refresh collide with and
+	// overwrite the first post-Init generation.
+	svc.revisions.Range(func(_, value any) bool {
+		value.(*atomic.Uint64).Add(1)
+		return true
+	})
+	svc.configs.Range(func(key, _ any) bool {
+		svc.configs.Delete(key)
+		return true
+	})
 	svc.updateAll(ctx)
 }
 
@@ -144,13 +169,15 @@ func (svc *Service) Run(ctx context.Context) {
 
 // RemoveCluster removes cluster data of a given uuid from cache.
 func (svc *Service) RemoveCluster(clusterID uuid.UUID) {
-	svc.configs.Delete(clusterID.String())
+	revision := svc.nextRevision(clusterID)
+	svc.invalidateOlderConfig(clusterID, revision)
 }
 
 // ForceUpdateCluster updates single cluster config in cache and does it outside the background process.
 // Hosts argument allows for restricting the update to specific hosts. Empty hosts results in full update.
 func (svc *Service) ForceUpdateCluster(ctx context.Context, clusterID uuid.UUID, hosts ...string) bool {
 	logger := svc.logger.Named("Force update cluster").With("cluster", clusterID)
+	revision := svc.beginRefresh(clusterID)
 
 	c, err := svc.clusterSvc.GetCluster(ctx, clusterID.String())
 	if err != nil {
@@ -158,7 +185,7 @@ func (svc *Service) ForceUpdateCluster(ctx context.Context, clusterID uuid.UUID,
 		return false
 	}
 
-	return svc.updateSingle(ctx, c, hosts...)
+	return svc.updateSingle(ctx, c, revision, hosts...)
 }
 
 // AvailableHosts returns list of hosts of given cluster that keep their configuration in cache.
@@ -184,9 +211,8 @@ func (svc *Service) AvailableHosts(ctx context.Context, clusterID uuid.UUID) ([]
 	return availableHosts, nil
 }
 
-func (svc *Service) updateSingle(ctx context.Context, c *cluster.Cluster, hosts ...string) bool {
+func (svc *Service) updateSingle(ctx context.Context, c *cluster.Cluster, revision uint64, hosts ...string) bool {
 	logger := svc.logger.Named("Cluster config update").With("cluster", c.ID)
-
 	clusterConfig := &sync.Map{}
 
 	client, err := svc.scyllaClient(ctx, c.ID)
@@ -205,6 +231,7 @@ func (svc *Service) updateSingle(ctx context.Context, c *cluster.Cluster, hosts 
 		hosts = client.Config().Hosts
 	}
 	hostsWg := sync.WaitGroup{}
+	failed := atomic.Bool{}
 	for _, host := range hosts {
 		hostsWg.Add(1)
 		hostKey := host
@@ -218,8 +245,13 @@ func (svc *Service) updateSingle(ctx context.Context, c *cluster.Cluster, hosts 
 		go func() {
 			defer hostsWg.Done()
 
-			config, err := svc.retrieveNodeConfig(ctx, hostKey, client, c)
+			loader := svc.nodeConfigLoader
+			if loader == nil {
+				loader = svc.retrieveNodeConfig
+			}
+			config, err := loader(ctx, hostKey, client, c)
 			if err != nil {
+				failed.Store(true)
 				perHostLogger.Error(ctx, "Couldn't read cluster host config", "error", err)
 				return
 			}
@@ -227,9 +259,90 @@ func (svc *Service) updateSingle(ctx context.Context, c *cluster.Cluster, hosts 
 		}()
 	}
 	hostsWg.Wait()
-	svc.configs.Store(c.ID.String(), clusterConfig)
+	if failed.Load() {
+		// A partially refreshed cluster is not safe to consume: callers could
+		// otherwise continue running tasks against only the nodes whose old or
+		// rotated TLS material happened to load successfully.
+		return false
+	}
+	if !svc.publishConfig(c.ID, revision, clusterConfig) {
+		logger.Info(ctx, "Discarding stale cluster config refresh", "revision", revision)
+		return false
+	}
 
 	return true
+}
+
+func (svc *Service) beginRefresh(clusterID uuid.UUID) uint64 {
+	revision := svc.nextRevision(clusterID)
+	// Remove the previous material before reading either the cluster row or its
+	// rotated secrets. A failed refresh must never retain stale trust/identity.
+	svc.invalidateOlderConfig(clusterID, revision)
+	return revision
+}
+
+func (svc *Service) invalidateOlderConfig(clusterID uuid.UUID, revision uint64) {
+	key := clusterID.String()
+	for {
+		raw, ok := svc.configs.Load(key)
+		if !ok {
+			return
+		}
+		entry, ok := raw.(*clusterConfigEntry)
+		if !ok {
+			panic("cluster config cache stores unexpected type")
+		}
+		if entry.revision >= revision {
+			return
+		}
+		if svc.configs.CompareAndDelete(key, raw) {
+			return
+		}
+	}
+}
+
+func (svc *Service) publishConfig(clusterID uuid.UUID, revision uint64, configs *sync.Map) bool {
+	key := clusterID.String()
+	candidate := &clusterConfigEntry{revision: revision, configs: configs}
+	for svc.currentRevision(clusterID) == revision {
+		raw, loaded := svc.configs.LoadOrStore(key, candidate)
+		if !loaded {
+			if svc.currentRevision(clusterID) == revision {
+				return true
+			}
+			svc.configs.CompareAndDelete(key, candidate)
+			return false
+		}
+		entry, ok := raw.(*clusterConfigEntry)
+		if !ok {
+			panic("cluster config cache stores unexpected type")
+		}
+		if entry.revision > revision {
+			return false
+		}
+		if svc.configs.CompareAndSwap(key, raw, candidate) {
+			if svc.currentRevision(clusterID) == revision {
+				return true
+			}
+			svc.configs.CompareAndDelete(key, candidate)
+			return false
+		}
+	}
+	return false
+}
+
+func (svc *Service) nextRevision(clusterID uuid.UUID) uint64 {
+	key := clusterID.String()
+	v, _ := svc.revisions.LoadOrStore(key, &atomic.Uint64{})
+	return v.(*atomic.Uint64).Add(1)
+}
+
+func (svc *Service) currentRevision(clusterID uuid.UUID) uint64 {
+	v, ok := svc.revisions.Load(clusterID.String())
+	if !ok {
+		return 0
+	}
+	return v.(*atomic.Uint64).Load()
 }
 
 func (svc *Service) updateAll(ctx context.Context) {
@@ -242,7 +355,9 @@ func (svc *Service) updateAll(ctx context.Context) {
 	clustersWg := sync.WaitGroup{}
 	for _, c := range clusters {
 		clustersWg.Go(func() {
-			svc.updateSingle(ctx, c)
+			// Refetch by ID so a delayed background pass cannot publish a
+			// pre-rotation Cluster snapshot after a newer forced refresh.
+			svc.ForceUpdateCluster(ctx, c.ID)
 		})
 	}
 	clustersWg.Wait()
@@ -255,11 +370,14 @@ func (svc *Service) readClusterConfig(clusterID uuid.UUID) (*sync.Map, error) {
 	if !ok {
 		return emptyConfig, ErrNoClusterConfig
 	}
-	clusterConfig, ok := rawClusterConfig.(*sync.Map)
+	entry, ok := rawClusterConfig.(*clusterConfigEntry)
 	if !ok {
 		panic("cluster cache emptyConfig stores unexpected type")
 	}
-	return clusterConfig, nil
+	if entry.revision != svc.currentRevision(clusterID) {
+		return emptyConfig, ErrNoClusterConfig
+	}
+	return entry.configs, nil
 }
 
 func (svc *Service) retrieveNodeConfig(ctx context.Context, host string, client *scyllaclient.Client,
