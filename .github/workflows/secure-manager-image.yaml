@@ -20,6 +20,7 @@ permissions:
   contents: read
 
 env:
+  TZ: Europe/Warsaw
   IMAGE_NAME: ghcr.io/lightning-codes/scylla-manager
   BUILDX_VERSION: v0.34.1
   BUILDX_LINUX_AMD64_SHA256: f1332ddb9010bd0b72628266c3a906d9a6979848033df4c8d9bd2cd113bae12b

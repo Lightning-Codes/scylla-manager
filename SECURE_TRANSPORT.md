@@ -230,10 +230,15 @@ verifies the OCI index, its distinct linux/amd64 and linux/arm64 child
 manifests, and each child's image-config OS/architecture. A digest-pinned Syft
 image generates attempt-unique per-child SPDX JSON SBOMs. The final `release`
 job is protected by a pre-created `secure-image-release` GitHub environment
-with required reviewers, prevention of self-review, and administrator bypass
-disabled. All manual releases share one non-canceling concurrency group. The
-environment must be configured before the first dispatch; GitHub otherwise
-auto-creates it without those protections.
+with a 30-minute wait timer, administrator bypass disabled, and a deployment
+branch policy restricted to `sophena/secure-cluster-tls`. All manual releases
+share one non-canceling concurrency group. The environment must be configured
+before the first dispatch; GitHub otherwise auto-creates it without those
+protections. The required authorization controls are the external
+hash-specific code and workflow approvals plus the separate authorized action
+that makes the newly created GHCR package Public while the environment waits;
+the one-member repository cannot provide an independent in-environment
+reviewer.
 
 For the first publication, the digest-only candidate job creates the GHCR
 package and then the environment gate pauses the final job. An authorized
