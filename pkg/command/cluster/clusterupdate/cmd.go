@@ -144,7 +144,6 @@ func (cmd *command) run() error {
 		cluster.ForceNonSslSessionPort = cmd.forceNonSSLSessionPort
 		ok = true
 	}
-
 	if cmd.username != "" && cmd.password == "" {
 		return errors.New("missing flag \"password\"")
 	}
@@ -239,7 +238,7 @@ func (cmd *command) run() error {
 		}
 	}
 	if deleteAny {
-		return cmd.client.DeleteClusterSecretsWithOptions(cmd.Context(), cmd.cluster, deleteOptions)
+		return cmd.client.DeleteClusterSecretsWithOptions(cmd.Context(), cluster.ID, deleteOptions)
 	}
 	return nil
 }

@@ -23,8 +23,13 @@ type tablesWorker struct {
 
 	hostInfo     map[string]HostInfo
 	tableVersion map[TableName]string
-	repairSvc    *repair.Service
+	repairSvc    repairServicer
 	progress     *TotalRestoreProgress
+}
+
+type repairServicer interface {
+	GetTarget(context.Context, uuid.UUID, json.RawMessage) (repair.Target, error)
+	Repair(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, repair.Target) error
 }
 
 // TotalRestoreProgress is a struct that holds information about the total progress of the restore job.
@@ -66,7 +71,7 @@ func (p *TotalRestoreProgress) Update(bytesRestored int64) {
 	p.restoredBytes += bytesRestored
 }
 
-func newTablesWorker(ctx context.Context, w worker, repairSvc *repair.Service, totalBytes int64) (*tablesWorker, error) {
+func newTablesWorker(ctx context.Context, w worker, repairSvc repairServicer, totalBytes int64) (*tablesWorker, error) {
 	versions := make(map[TableName]string)
 	for _, u := range w.run.Units {
 		for _, t := range u.Tables {
@@ -316,6 +321,7 @@ func (w *tablesWorker) restoreBatch(ctx context.Context, hi HostInfo, b batch) e
 }
 
 func (w *tablesWorker) stageRepair(ctx context.Context) error {
+	ctx = w.connectionContext(ctx)
 	var keyspace []string
 	for _, u := range w.run.Units {
 		for _, t := range u.Tables {

@@ -83,6 +83,7 @@ func (s *Service) One2OneRestore(ctx context.Context, clusterID, taskID, runID u
 	if err != nil {
 		return errors.Wrap(err, "new worker")
 	}
+	ctx = w.connectionContext(ctx)
 	defer w.clusterSession.Close()
 
 	target, err := w.parseTarget(ctx, properties)
@@ -123,18 +124,23 @@ func (s *Service) newWorker(ctx context.Context, clusterID, taskID, runID uuid.U
 	if err != nil {
 		return worker{}, errors.Wrap(err, "get client")
 	}
+	generation := client.Config().ConnectionGeneration
+	ctx = cluster.WithExpectedConnectionGeneration(ctx, generation)
 	clusterSession, err := s.clusterSession(ctx, clusterID)
 	if err != nil {
 		return worker{}, errors.Wrap(err, "get CQL cluster session")
 	}
 
 	return worker{
-		managerSession: s.session,
+		managerSession:       s.session,
+		connectionGeneration: generation,
 
 		client:         client,
 		clusterSession: clusterSession,
-		sessionFunc:    s.clusterSession,
-		repairSvc:      s.repairSvc,
+		sessionFunc: func(callCtx context.Context, id uuid.UUID, opts ...cluster.SessionConfigOption) (gocqlx.Session, error) {
+			return s.clusterSession(cluster.WithExpectedConnectionGeneration(callCtx, generation), id, opts...)
+		},
+		repairSvc: s.repairSvc,
 
 		logger:  s.logger,
 		metrics: s.metrics,
@@ -153,6 +159,7 @@ func (s *Service) GetProgress(ctx context.Context, clusterID, taskID, runID uuid
 	if err != nil {
 		return Progress{}, errors.Wrap(err, "new worker")
 	}
+	ctx = w.connectionContext(ctx)
 	pr, err := w.getProgress(ctx)
 	if err != nil {
 		return Progress{}, errors.Wrap(err, "get progress")

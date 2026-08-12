@@ -45,6 +45,7 @@ type ClusterService interface {
 	DeleteSSLUserCert(ctx context.Context, id uuid.UUID) error
 	CheckTLSTrust(id uuid.UUID, protocol string) (bool, error)
 	DeleteTLSTrust(ctx context.Context, id uuid.UUID, protocol string) error
+	DeleteConnectionSecrets(ctx context.Context, id uuid.UUID, deletion cluster.SecretDeletion) error
 	ListNodes(ctx context.Context, id uuid.UUID) ([]cluster.Node, error)
 }
 

@@ -26,6 +26,7 @@ import (
 	"github.com/scylladb/scylla-manager/v3/pkg/schema/table"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/backup"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/configcache"
 	scyllaTable "github.com/scylladb/scylla-manager/v3/pkg/table"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/query"
@@ -41,6 +42,10 @@ type worker struct {
 	target           Target
 	cqlSchema        *query.DescribedSchema
 	alternatorSchema backupspec.AlternatorSchema
+	// connectionGeneration is captured with every client/session/cache input
+	// assembled by newWorker. Every later phase, including the repair handoff,
+	// re-pins its context to this exact immutable snapshot.
+	connectionGeneration uuid.UUID
 
 	config  Config
 	logger  log.Logger
@@ -51,6 +56,10 @@ type worker struct {
 	clusterSession   gocqlx.Session
 	alternatorClient *dynamodb.Client // Initialized only if alternator is enabled in the cluster
 	nodeConfig       map[netip.Addr]configcache.NodeConfig
+}
+
+func (w *worker) connectionContext(ctx context.Context) context.Context {
+	return cluster.WithExpectedConnectionGeneration(ctx, w.connectionGeneration)
 }
 
 func (w *worker) init(ctx context.Context, properties json.RawMessage) error {

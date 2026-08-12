@@ -111,25 +111,13 @@ var rootCmd = &cobra.Command{
 		}
 		c.Database.InitAddr = net.JoinHostPort(initHost, strconv.Itoa(c.Database.Port))
 
-		// Create keyspace if needed
-		ok, err := keyspaceExists(ctx, c, logger)
-		if err != nil {
+		// This secure branch is greenfield-only. A first start claims a truly
+		// empty keyspace before migration. A prior owned-but-incomplete attempt
+		// is discarded and replayed from an empty keyspace because historical
+		// migrations are not statement-level crash-idempotent.
+		if err := initializeManagerDatabase(ctx, c, logger); err != nil {
 			return errors.Wrapf(err, "db init")
 		}
-		if !ok {
-			logger.Info(ctx, "Creating keyspace", "keyspace", c.Database.Keyspace)
-			if err := createKeyspace(ctx, c, logger); err != nil {
-				return errors.Wrapf(err, "db init")
-			}
-			logger.Info(ctx, "Keyspace created", "keyspace", c.Database.Keyspace)
-		}
-
-		// Migrate schema
-		logger.Info(ctx, "Migrating schema", "keyspace", c.Database.Keyspace)
-		if err := migrateSchema(ctx, c, logger); err != nil {
-			return errors.Wrapf(err, "db init")
-		}
-		logger.Info(ctx, "Schema up to date", "keyspace", c.Database.Keyspace)
 
 		// Start server
 		s, err := newServer(c, logger)

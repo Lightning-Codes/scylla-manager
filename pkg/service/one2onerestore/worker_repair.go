@@ -25,6 +25,7 @@ func (w *worker) tablesToRepair(views []View) []scyllaTable {
 }
 
 func (w *worker) repair(ctx context.Context, tablesToRepair []scyllaTable) error {
+	ctx = w.connectionContext(ctx)
 	var keyspaceFilter []string
 	for _, table := range tablesToRepair {
 		keyspaceFilter = append(keyspaceFilter, table.keyspace+"."+table.table)

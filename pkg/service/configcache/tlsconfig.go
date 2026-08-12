@@ -9,7 +9,6 @@ import (
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 	"github.com/scylladb/scylla-manager/v3/pkg/secrets"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
-	"github.com/scylladb/scylla-manager/v3/pkg/store"
 	"github.com/scylladb/scylla-manager/v3/pkg/util"
 )
 
@@ -20,20 +19,26 @@ type TLSConfigWithAddress struct {
 	Address string
 }
 
-func newCQLTLSConfigIfEnabled(c *cluster.Cluster, nodeInfo *scyllaclient.NodeInfo, secretsStore store.Store,
-	host string,
-) (*TLSConfigWithAddress, error) {
+func newCQLTLSConfigIfEnabled(c *cluster.Cluster, nodeInfo *scyllaclient.NodeInfo, host string) (*TLSConfigWithAddress, error) {
 	cqlTLSEnabled, cqlClientCertAuth := nodeInfo.CQLTLSEnabled()
 	if !cqlTLSEnabled || c.ForceTLSDisabled {
 		return nil, nil // nolint: nilnil
 	}
 	cqlAddress := nodeInfo.CQLAddr(host, c.ForceTLSDisabled || c.ForceNonSSLSessionPort)
-	tlsConfig, err := secrets.LoadTLSConfig(secretsStore, secrets.NewCQLTLSTrust(c.ID))
+	trust := secrets.NewCQLTLSTrust(c.ID)
+	trust.CA, trust.ServerName = c.CQLCAFile, c.CQLServerName
+	var tlsConfig *tls.Config
+	var err error
+	if len(trust.CA) != 0 || trust.ServerName != "" {
+		tlsConfig, err = secrets.TLSConfig(trust)
+	} else {
+		err = util.ErrNotFound
+	}
 	if err != nil {
 		return nil, errors.Wrap(err, "CQL TLS is enabled, but strict CQL trust is unavailable")
 	}
 	if cqlClientCertAuth {
-		cert, err := prepareCertificates(c, secretsStore)
+		cert, err := prepareCertificates(c)
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS configuration for CQL session")
 		}
@@ -45,21 +50,27 @@ func newCQLTLSConfigIfEnabled(c *cluster.Cluster, nodeInfo *scyllaclient.NodeInf
 	}, nil
 }
 
-func newAlternatorTLSConfigIfEnabled(c *cluster.Cluster, nodeInfo *scyllaclient.NodeInfo, secretsStore store.Store,
-	host string,
-) (*TLSConfigWithAddress, error) {
+func newAlternatorTLSConfigIfEnabled(c *cluster.Cluster, nodeInfo *scyllaclient.NodeInfo, host string) (*TLSConfigWithAddress, error) {
 	alternatorTLSEnabled, alternatorClientCertAuth := nodeInfo.AlternatorTLSEnabled()
 	if !alternatorTLSEnabled {
 		return nil, nil // nolint: nilnil
 	}
 	alternatorAddress := nodeInfo.AlternatorAddr(host)
 
-	tlsConfig, err := secrets.LoadTLSConfig(secretsStore, secrets.NewAlternatorTLSTrust(c.ID))
+	trust := secrets.NewAlternatorTLSTrust(c.ID)
+	trust.CA, trust.ServerName = c.AlternatorCAFile, c.AlternatorServerName
+	var tlsConfig *tls.Config
+	var err error
+	if len(trust.CA) != 0 || trust.ServerName != "" {
+		tlsConfig, err = secrets.TLSConfig(trust)
+	} else {
+		err = util.ErrNotFound
+	}
 	if err != nil {
 		return nil, errors.Wrap(err, "Alternator TLS is enabled, but strict Alternator trust is unavailable")
 	}
 	if alternatorClientCertAuth {
-		cert, err := prepareCertificates(c, secretsStore)
+		cert, err := prepareCertificates(c)
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS configuration for Alternator session")
 		}
@@ -71,11 +82,16 @@ func newAlternatorTLSConfigIfEnabled(c *cluster.Cluster, nodeInfo *scyllaclient.
 	}, nil
 }
 
-func prepareCertificates(c *cluster.Cluster, secretsStore store.Store) (cert tls.Certificate, err error) {
+func prepareCertificates(c *cluster.Cluster) (cert tls.Certificate, err error) {
 	id := &secrets.TLSIdentity{
-		ClusterID: c.ID,
+		ClusterID:  c.ID,
+		Cert:       c.SSLUserCertFile,
+		PrivateKey: c.SSLUserKeyFile,
 	}
-	if err := secretsStore.Get(id); err != nil {
+	if len(id.Cert) == 0 && len(id.PrivateKey) == 0 {
+		err = util.ErrNotFound
+	}
+	if err != nil {
 		if !errors.Is(err, util.ErrNotFound) {
 			return tls.Certificate{}, errors.Wrap(err, "fetch TLS config")
 		}

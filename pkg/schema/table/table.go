@@ -62,22 +62,34 @@ var (
 	})
 
 	Cluster = table.New(table.Metadata{
-		Name: "cluster",
+		Name: "secure_cluster",
 		Columns: []string{
-			"auth_token",
-			"force_non_ssl_session_port",
-			"force_tls_disabled",
-			"host",
+			"connection_deleted",
+			"connection_generation",
 			"id",
-			"known_hosts",
 			"labels",
+			"lifecycle_epoch",
 			"name",
-			"port",
 		},
 		PartKey: []string{
 			"id",
 		},
 		SortKey: []string{},
+	})
+
+	SecureConnectionBundle = table.New(table.Metadata{
+		Name: "secure_connection_bundle",
+		Columns: []string{
+			"cluster_id",
+			"key",
+			"value",
+		},
+		PartKey: []string{
+			"cluster_id",
+		},
+		SortKey: []string{
+			"key",
+		},
 	})
 
 	Drawer = table.New(table.Metadata{

@@ -5,6 +5,7 @@
 package cluster_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -42,16 +43,15 @@ func TestValidateHostConnectivityIntegration(t *testing.T) {
 
 	Print("given: the fresh cluster")
 	var (
-		ctx          = context.Background()
-		session      = CreateScyllaManagerDBSession(t)
-		secretsStore = store.NewTableStore(session, table.Secrets)
-		c            = &cluster.Cluster{
+		ctx     = context.Background()
+		session = CreateScyllaManagerDBSession(t)
+		c       = &cluster.Cluster{
 			AuthToken: "token",
 			Host:      ManagedClusterHost(),
 		}
 	)
 	secureManagedCluster(t, c)
-	s, err := cluster.NewService(session, metrics.NewClusterMetrics(), secretsStore, scyllaclient.DefaultTimeoutConfig(),
+	s, err := cluster.NewService(session, metrics.NewClusterMetrics(), scyllaclient.DefaultTimeoutConfig(),
 		server.DefaultConfig().ClientCacheTimeout, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -166,8 +166,7 @@ func TestClientIntegration(t *testing.T) {
 	expectedHosts := ManagedClusterHosts()
 
 	session := CreateScyllaManagerDBSession(t)
-	secretsStore := store.NewTableStore(session, table.Secrets)
-	s, err := cluster.NewService(session, metrics.NewClusterMetrics(), secretsStore, scyllaclient.DefaultTimeoutConfig(),
+	s, err := cluster.NewService(session, metrics.NewClusterMetrics(), scyllaclient.DefaultTimeoutConfig(),
 		server.DefaultConfig().ClientCacheTimeout, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -192,9 +191,12 @@ func TestClientIntegration(t *testing.T) {
 	// the expectation is that client will finally manage to clean it up
 	// and will update known_hosts to its proper values
 	fakeHostWithOnlyOneCorrect := []string{"192.168.10.1", "192.168.10.2", c.KnownHosts[0]}
-	c.KnownHosts = fakeHostWithOnlyOneCorrect
-	q := table.Cluster.UpdateQuery(session, "known_hosts").BindStruct(c)
-	if err := q.ExecRelease(); err != nil {
+	staleGeneration := c.ConnectionGeneration
+	staleSnapshot := *c
+	staleSnapshot.KnownHosts = fakeHostWithOnlyOneCorrect
+	staleBundle := cluster.ConnectionBundleForTest(&staleSnapshot, uuid.MustRandom())
+	staleBundle.PreviousGeneration = staleGeneration
+	if err := s.CommitConnectionGenerationForTest(context.Background(), &staleSnapshot, staleBundle, staleGeneration, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,8 +238,7 @@ func TestAlternatorClientIntegration(t *testing.T) {
 	smSession := CreateScyllaManagerDBSession(t)
 	defer smSession.Close()
 
-	secretsStore := store.NewTableStore(smSession, table.Secrets)
-	s, err := cluster.NewService(smSession, metrics.NewClusterMetrics(), secretsStore, scyllaclient.DefaultTimeoutConfig(),
+	s, err := cluster.NewService(smSession, metrics.NewClusterMetrics(), scyllaclient.DefaultTimeoutConfig(),
 		server.DefaultConfig().ClientCacheTimeout, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -290,13 +291,13 @@ func TestAlternatorClientIntegration(t *testing.T) {
 func TestServiceStorageIntegration(t *testing.T) {
 	session := CreateScyllaManagerDBSession(t)
 
-	secretsStore := store.NewTableStore(session, table.Secrets)
+	connectionStore := store.NewTableStore(session, table.SecureConnectionBundle)
 
 	cfg := scyllaclient.DefaultTimeoutConfig()
 	cfg.Timeout = 2 * time.Second
 	cfg.Backoff.WaitMax = 2 * time.Second
 	cfg.Backoff.MaxRetries = 1
-	s, err := cluster.NewService(session, metrics.NewClusterMetrics(), secretsStore, cfg,
+	s, err := cluster.NewService(session, metrics.NewClusterMetrics(), cfg,
 		server.DefaultConfig().ClientCacheTimeout, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -311,6 +312,9 @@ func TestServiceStorageIntegration(t *testing.T) {
 	setup := func(t *testing.T) {
 		t.Helper()
 		ExecStmt(t, session, "TRUNCATE cluster")
+		ExecStmt(t, session, "TRUNCATE secure_cluster")
+		ExecStmt(t, session, "TRUNCATE secure_connection_bundle")
+		ExecStmt(t, session, "TRUNCATE secrets")
 	}
 
 	ctx := context.Background()
@@ -485,35 +489,19 @@ func TestServiceStorageIntegration(t *testing.T) {
 
 	assertSecrets := func(t *testing.T, c *cluster.Cluster) {
 		t.Helper()
-
-		cqlCreds := &secrets.CQLCreds{
-			ClusterID: c.ID,
-		}
-		if err := secretsStore.Get(cqlCreds); err != nil {
+		active, err := s.GetClusterByID(ctx, c.ID)
+		if err != nil {
 			t.Fatal(err)
 		}
-		alternatorCreds := &secrets.AlternatorCreds{
-			ClusterID: c.ID,
-		}
-		if err := secretsStore.Get(alternatorCreds); err != nil {
+		bundle := secrets.NewConnectionBundle(c.ID)
+		bundle.Generation = active.ConnectionGeneration
+		if err := connectionStore.Get(bundle); err != nil {
 			t.Fatal(err)
 		}
-		tlsIdentity := &secrets.TLSIdentity{
-			ClusterID: c.ID,
-		}
-		if err := secretsStore.Get(tlsIdentity); err != nil {
-			t.Fatal(err)
-		}
-
-		goldenCqlCreds, goldenAlternatorCreds, goldenTlsIdentity := goldenSecrets(c)
-		if diff := cmp.Diff(goldenCqlCreds, cqlCreds, diffOpts...); diff != "" {
-			t.Error("Invalid CQL creds, diff", diff)
-		}
-		if diff := cmp.Diff(goldenAlternatorCreds, alternatorCreds, diffOpts...); diff != "" {
-			t.Error("Invalid alternator creds, diff", diff)
-		}
-		if diff := cmp.Diff(goldenTlsIdentity, tlsIdentity, diffOpts...); diff != "" {
-			t.Error("Invalid TLS identity, diff", diff)
+		if bundle.CQLUsername != c.Username || bundle.CQLPassword != c.Password ||
+			bundle.AlternatorAccessKeyID != c.AlternatorAccessKeyID || bundle.AlternatorSecretAccessKey != c.AlternatorSecretAccessKey ||
+			!bytes.Equal(bundle.CQLClientCertificate, c.SSLUserCertFile) || !bytes.Equal(bundle.CQLClientPrivateKey, c.SSLUserKeyFile) {
+			t.Fatalf("active connection bundle does not contain one complete secret tuple: %#v", bundle)
 		}
 	}
 
@@ -633,7 +621,7 @@ func TestServiceStorageIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("delete cluster removes secrets", func(t *testing.T) {
+	t.Run("delete cluster commits empty tombstone and retains old immutable bundle", func(t *testing.T) {
 		setup(t)
 
 		c := tlsCluster(t)
@@ -642,26 +630,26 @@ func TestServiceStorageIntegration(t *testing.T) {
 		if err := s.PutCluster(ctx, c); err != nil {
 			t.Fatal(err)
 		}
+		active, err := s.GetClusterByID(ctx, c.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldBundle := secrets.NewConnectionBundle(c.ID)
+		oldBundle.Generation = active.ConnectionGeneration
+		if err := connectionStore.Get(oldBundle); err != nil {
+			t.Fatal(err)
+		}
 		if err := s.DeleteCluster(ctx, c.ID); err != nil {
 			t.Fatal(err)
 		}
-
-		cqlCreds := &secrets.CQLCreds{
-			ClusterID: c.ID,
+		if _, err := s.GetClusterByID(ctx, c.ID); !errors.Is(err, util.ErrNotFound) {
+			t.Fatalf("deleted tombstone remained visible: %v", err)
 		}
-		if err := secretsStore.Get(cqlCreds); !errors.Is(err, util.ErrNotFound) {
-			t.Fatal(err)
-		}
-		tlsIdentity := &secrets.TLSIdentity{
-			ClusterID: c.ID,
-		}
-		if err := secretsStore.Get(tlsIdentity); !errors.Is(err, util.ErrNotFound) {
-			t.Fatal(err)
-		}
-		alternatorCreds := &secrets.AlternatorCreds{
-			ClusterID: c.ID,
-		}
-		if err := secretsStore.Get(alternatorCreds); !errors.Is(err, util.ErrNotFound) {
+		// A retained old row is still immutable and addressable to a reader that
+		// captured A before D committed; it is never selected by new callers.
+		retained := secrets.NewConnectionBundle(c.ID)
+		retained.Generation = oldBundle.Generation
+		if err := connectionStore.Get(retained); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -679,11 +667,9 @@ func TestServiceStorageIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		cqlCreds := &secrets.CQLCreds{
-			ClusterID: c.ID,
-		}
-		if err := secretsStore.Get(cqlCreds); !errors.Is(err, util.ErrNotFound) {
-			t.Fatal(err)
+		configured, err := s.CheckCQLCredentials(c.ID)
+		if err != nil || configured {
+			t.Fatalf("CQL credentials still active: configured=%v err=%v", configured, err)
 		}
 	})
 
@@ -700,11 +686,9 @@ func TestServiceStorageIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		alternatorCreds := &secrets.AlternatorCreds{
-			ClusterID: c.ID,
-		}
-		if err := secretsStore.Get(alternatorCreds); !errors.Is(err, util.ErrNotFound) {
-			t.Fatal(err)
+		configured, err := s.CheckAlternatorCredentials(c.ID)
+		if err != nil || configured {
+			t.Fatalf("Alternator credentials still active: configured=%v err=%v", configured, err)
 		}
 	})
 
@@ -721,11 +705,9 @@ func TestServiceStorageIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		tlsIdentity := &secrets.TLSIdentity{
-			ClusterID: c.ID,
-		}
-		if err := secretsStore.Get(tlsIdentity); !errors.Is(err, util.ErrNotFound) {
-			t.Fatal(err)
+		configured, err := s.CheckSSLUserCert(c.ID)
+		if err != nil || configured {
+			t.Fatalf("CQL client identity still active: configured=%v err=%v", configured, err)
 		}
 	})
 
@@ -838,8 +820,8 @@ func TestServiceStorageIntegration(t *testing.T) {
 		}
 
 		var cnt int
-		if err := session.Query("SELECT COUNT(*) FROM cluster", nil).GetRelease(&cnt); err != nil {
-			t.Fatalf("check SM DB cluster table entries: %s", err)
+		if err := session.Query("SELECT COUNT(*) FROM secure_cluster", nil).GetRelease(&cnt); err != nil {
+			t.Fatalf("check secure Manager cluster table entries: %s", err)
 		}
 		if cnt != 0 {
 			t.Fatalf("expected no entries in SM DB cluster table, got: %d", cnt)
@@ -918,28 +900,6 @@ func TestServiceStorageIntegration(t *testing.T) {
 		}
 		if len(getCluster.KnownHosts) != len(hosts) {
 			t.Fatalf("Expected %d known hosts, got %d", len(hosts), len(getCluster.KnownHosts))
-		}
-	})
-
-	t.Run("no --host in SM DB", func(t *testing.T) {
-		setup(t)
-		c := validCluster(t)
-		if err := s.PutCluster(ctx, c); err != nil {
-			t.Fatal(err)
-		}
-
-		if err := session.Query(fmt.Sprintf("UPDATE cluster SET host = '' WHERE id = %s", c.ID), nil).ExecRelease(); err != nil {
-			t.Fatalf("remove --host from SM DB: %s", err)
-		}
-
-		client, err := s.CreateClientNoCache(context.Background(), c.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, h := range ManagedClusterHosts() {
-			if _, err := client.HostRack(ctx, h); err != nil {
-				t.Fatalf("test client by getting rack of host %s: %s", h, err)
-			}
 		}
 	})
 
@@ -1025,6 +985,234 @@ func TestServiceStorageIntegration(t *testing.T) {
 			t.Fatal(diff)
 		}
 	})
+}
+
+func TestConnectionGenerationLWTTwoWritersIntegration(t *testing.T) {
+	session := CreateScyllaManagerDBSession(t)
+	connectionStore := store.NewTableStore(session, table.SecureConnectionBundle)
+	ExecStmt(t, session, "TRUNCATE secure_cluster")
+	ExecStmt(t, session, "TRUNCATE secure_connection_bundle")
+	newService := func() *cluster.Service {
+		svc, err := cluster.NewService(session, metrics.NewClusterMetrics(), scyllaclient.DefaultTimeoutConfig(),
+			server.DefaultConfig().ClientCacheTimeout, log.NewDevelopment())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return svc
+	}
+	first, second := newService(), newService()
+	id, a := uuid.MustRandom(), uuid.MustRandom()
+	base := &secrets.ConnectionBundle{
+		ClusterID:       id,
+		Generation:      a,
+		LifecycleEpoch:  1,
+		Host:            "generation-a.internal",
+		AuthToken:       "generation-a-token",
+		AgentCA:         integrationConnectionCA(t),
+		AgentServerName: "agent.internal",
+	}
+	if err := first.CommitConnectionGenerationForTest(context.Background(), &cluster.Cluster{
+		ID: id, Name: "atomic-lwt", Host: base.Host,
+	}, base, uuid.Nil, true); err != nil {
+		t.Fatal(err)
+	}
+
+	b, deleted := uuid.MustRandom(), uuid.MustRandom()
+	update := &secrets.ConnectionBundle{
+		ClusterID:          id,
+		Generation:         b,
+		LifecycleEpoch:     1,
+		PreviousGeneration: a,
+		Host:               "generation-b.internal",
+		AuthToken:          "generation-b-token",
+		AgentCA:            integrationConnectionCA(t),
+		AgentServerName:    "agent.internal",
+	}
+	tombstone := &secrets.ConnectionBundle{
+		ClusterID:          id,
+		Generation:         deleted,
+		LifecycleEpoch:     2,
+		PreviousGeneration: a,
+		Deleted:            true,
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		<-start
+		results <- first.CommitConnectionGenerationForTest(context.Background(), &cluster.Cluster{
+			ID: id, Name: "atomic-lwt", Host: update.Host,
+		}, update, a, false)
+	}()
+	go func() {
+		<-start
+		results <- second.CommitConnectionGenerationForTest(context.Background(), &cluster.Cluster{
+			ID: id, ConnectionDeleted: true,
+		}, tombstone, a, false)
+	}()
+	close(start)
+	var success, conflict int
+	for range 2 {
+		err := <-results
+		switch {
+		case err == nil:
+			success++
+		case errors.Is(err, cluster.ErrConnectionCommitConflict):
+			conflict++
+		default:
+			t.Fatalf("unexpected LWT result: %v", err)
+		}
+	}
+	if success != 1 || conflict != 1 {
+		t.Fatalf("global SERIAL LWT did not choose one winner: success=%d conflict=%d", success, conflict)
+	}
+
+	var active uuid.UUID
+	if err := table.Cluster.GetQuery(session, "connection_generation").BindMap(map[string]any{"id": id}).GetRelease(&active); err != nil {
+		t.Fatal(err)
+	}
+	selected := secrets.NewConnectionBundle(id)
+	selected.Generation = active
+	if err := connectionStore.Get(selected); err != nil {
+		t.Fatalf("active pointer selected a missing bundle: %v", err)
+	}
+	if active == b && (selected.Deleted || selected.AuthToken != update.AuthToken || selected.PreviousGeneration != a) {
+		t.Fatalf("update winner is not one exact tuple: %#v", selected)
+	}
+	if active == deleted && (!selected.Deleted || selected.PreviousGeneration != a) {
+		t.Fatalf("delete winner is not one exact tombstone: %#v", selected)
+	}
+}
+
+func TestSecureConnectionReadersObserveOnlyCompleteGenerationsIntegration(t *testing.T) {
+	session := CreateScyllaManagerDBSession(t)
+	ExecStmt(t, session, "TRUNCATE secure_cluster")
+	ExecStmt(t, session, "TRUNCATE secure_connection_bundle")
+	newService := func() *cluster.Service {
+		svc, err := cluster.NewService(session, metrics.NewClusterMetrics(), scyllaclient.DefaultTimeoutConfig(),
+			server.DefaultConfig().ClientCacheTimeout, log.NewDevelopment())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return svc
+	}
+	writer := newService()
+	readers := []*cluster.Service{newService(), newService(), newService(), newService()}
+	id, a, b := uuid.MustRandom(), uuid.MustRandom(), uuid.MustRandom()
+	bundleA := &secrets.ConnectionBundle{
+		ClusterID: id, Generation: a, LifecycleEpoch: 1,
+		Host: "a.internal", KnownHosts: []string{"10.0.0.1"}, Port: 10001,
+		AuthToken: "a-token", CQLUsername: "a-user", CQLPassword: "a-password",
+		AgentCA: integrationConnectionCA(t), AgentServerName: "agent.internal",
+	}
+	if err := writer.CommitConnectionGenerationForTest(context.Background(), &cluster.Cluster{ID: id, Name: "atomic"}, bundleA, uuid.Nil, true); err != nil {
+		t.Fatal(err)
+	}
+	bundleB := &secrets.ConnectionBundle{
+		ClusterID: id, Generation: b, PreviousGeneration: a, LifecycleEpoch: 1,
+		Host: "b.internal", KnownHosts: []string{"10.0.0.2"}, Port: 10002,
+		AuthToken: "b-token", CQLUsername: "b-user", CQLPassword: "b-password",
+		AgentCA: integrationConnectionCA(t), AgentServerName: "agent.internal",
+	}
+
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	errs := make(chan error, 64)
+	var wg sync.WaitGroup
+	for _, reader := range readers {
+		reader := reader
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				c, err := reader.GetClusterByID(context.Background(), id)
+				if err != nil {
+					errs <- err
+					return
+				}
+				switch c.ConnectionGeneration {
+				case a:
+					if c.Host != bundleA.Host || c.Port != bundleA.Port || c.AuthToken != bundleA.AuthToken ||
+						c.Username != bundleA.CQLUsername || c.Password != bundleA.CQLPassword {
+						errs <- fmt.Errorf("mixed generation A snapshot: %#v", c)
+						return
+					}
+				case b:
+					if c.Host != bundleB.Host || c.Port != bundleB.Port || c.AuthToken != bundleB.AuthToken ||
+						c.Username != bundleB.CQLUsername || c.Password != bundleB.CQLPassword {
+						errs <- fmt.Errorf("mixed generation B snapshot: %#v", c)
+						return
+					}
+				default:
+					errs <- fmt.Errorf("unexpected active generation %s", c.ConnectionGeneration)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	if err := writer.CommitConnectionGenerationForTest(context.Background(), &cluster.Cluster{ID: id, Name: "atomic"}, bundleB, a, false); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
+func TestDeletedSecureClusterIDCannotBeRecreatedIntegration(t *testing.T) {
+	session := CreateScyllaManagerDBSession(t)
+	secureStore := store.NewTableStore(session, table.SecureConnectionBundle)
+	ExecStmt(t, session, "TRUNCATE secure_cluster")
+	ExecStmt(t, session, "TRUNCATE secure_connection_bundle")
+	svc, err := cluster.NewService(session, metrics.NewClusterMetrics(), scyllaclient.DefaultTimeoutConfig(),
+		server.DefaultConfig().ClientCacheTimeout, log.NewDevelopment())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, a, d, c := uuid.MustRandom(), uuid.MustRandom(), uuid.MustRandom(), uuid.MustRandom()
+	active := &secrets.ConnectionBundle{
+		ClusterID: id, Generation: a, LifecycleEpoch: 1,
+		Host: "active.internal", AuthToken: "active-token",
+		AgentCA: integrationConnectionCA(t), AgentServerName: "agent.internal",
+	}
+	if err := svc.CommitConnectionGenerationForTest(context.Background(), &cluster.Cluster{ID: id}, active, uuid.Nil, true); err != nil {
+		t.Fatal(err)
+	}
+	tombstone := &secrets.ConnectionBundle{ClusterID: id, Generation: d, PreviousGeneration: a, LifecycleEpoch: 2, Deleted: true}
+	if err := svc.CommitConnectionGenerationForTest(context.Background(), &cluster.Cluster{ID: id}, tombstone, a, false); err != nil {
+		t.Fatal(err)
+	}
+	recreate := &secrets.ConnectionBundle{
+		ClusterID: id, Generation: c, PreviousGeneration: d, LifecycleEpoch: 2,
+		Host: "recreate.internal", AuthToken: "recreate-token",
+		AgentCA: integrationConnectionCA(t), AgentServerName: "agent.internal",
+	}
+	if err := svc.CommitConnectionGenerationForTest(context.Background(), &cluster.Cluster{ID: id}, recreate, uuid.Nil, true); !errors.Is(err, cluster.ErrConnectionCommitConflict) {
+		t.Fatalf("tombstoned UUID was recreated: %v", err)
+	}
+	selected := secrets.NewConnectionBundle(id)
+	selected.Generation = d
+	if err := secureStore.Get(selected); err != nil || !selected.Deleted {
+		t.Fatalf("authoritative tombstone was replaced: bundle=%#v err=%v", selected, err)
+	}
+}
+
+func integrationConnectionCA(t *testing.T) []byte {
+	t.Helper()
+	ca, err := os.ReadFile("testdata/cluster.crt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ca
 }
 
 func validCluster(t *testing.T) *cluster.Cluster {
@@ -1114,20 +1302,4 @@ func tlsCluster(t *testing.T) *cluster.Cluster {
 	c.SSLUserCertFile = tlsCert
 	c.SSLUserKeyFile = tlsKey
 	return c
-}
-
-func goldenSecrets(c *cluster.Cluster) (*secrets.CQLCreds, *secrets.AlternatorCreds, *secrets.TLSIdentity) {
-	return &secrets.CQLCreds{
-			ClusterID: c.ID,
-			Username:  c.Username,
-			Password:  c.Password,
-		}, &secrets.AlternatorCreds{
-			ClusterID:       c.ID,
-			AccessKeyID:     c.AlternatorAccessKeyID,
-			SecretAccessKey: c.AlternatorSecretAccessKey,
-		}, &secrets.TLSIdentity{
-			ClusterID:  c.ID,
-			Cert:       c.SSLUserCertFile,
-			PrivateKey: c.SSLUserKeyFile,
-		}
 }

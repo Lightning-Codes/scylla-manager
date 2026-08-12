@@ -23,10 +23,8 @@ import (
 	"github.com/scylladb/scylla-manager/v3/pkg/service/configcache"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/scylladb/scylla-manager/v3/pkg/schema/table"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 	"github.com/scylladb/scylla-manager/v3/pkg/secrets"
-	"github.com/scylladb/scylla-manager/v3/pkg/store"
 	. "github.com/scylladb/scylla-manager/v3/pkg/testutils"
 	. "github.com/scylladb/scylla-manager/v3/pkg/testutils/db"
 	. "github.com/scylladb/scylla-manager/v3/pkg/testutils/testconfig"
@@ -62,8 +60,7 @@ func TestStatus_Ping_Independent_From_REST_Integration(t *testing.T) {
 	session := CreateScyllaManagerDBSession(t)
 	defer session.Close()
 
-	s := store.NewTableStore(session, table.Secrets)
-	clusterSvc, err := cluster.NewService(session, metrics.NewClusterMetrics(), s, scyllaclient.DefaultTimeoutConfig(),
+	clusterSvc, err := cluster.NewService(session, metrics.NewClusterMetrics(), scyllaclient.DefaultTimeoutConfig(),
 		0, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +86,7 @@ func TestStatus_Ping_Independent_From_REST_Integration(t *testing.T) {
 	}
 	configureManagedClusterCredentials(t, clusterSvc, testCluster)
 
-	configCacheSvc := configcache.NewService(configcache.DefaultConfig(), clusterSvc, scyllaClientProvider, s, logger.Named("config-cache"))
+	configCacheSvc := configcache.NewService(configcache.DefaultConfig(), clusterSvc, scyllaClientProvider, logger.Named("config-cache"))
 	configCacheSvc.Init(context.Background())
 
 	defaultConfigForHealthcheck := DefaultConfig()
@@ -97,7 +94,6 @@ func TestStatus_Ping_Independent_From_REST_Integration(t *testing.T) {
 	healthSvc, err := NewService(
 		defaultConfigForHealthcheck,
 		scyllaClientProvider,
-		s,
 		clusterSvc.GetClusterByID,
 		configCacheSvc,
 		logger,
@@ -157,8 +153,7 @@ func TestStatusIntegration(t *testing.T) {
 	session := CreateScyllaManagerDBSession(t)
 	defer session.Close()
 
-	s := store.NewTableStore(session, table.Secrets)
-	clusterSvc, err := cluster.NewService(session, metrics.NewClusterMetrics(), s, scyllaclient.DefaultTimeoutConfig(),
+	clusterSvc, err := cluster.NewService(session, metrics.NewClusterMetrics(), scyllaclient.DefaultTimeoutConfig(),
 		15*time.Minute, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +171,7 @@ func TestStatusIntegration(t *testing.T) {
 	}
 	configureManagedClusterCredentials(t, clusterSvc, c)
 
-	testStatusIntegration(t, c.ID, clusterSvc, clusterSvc.GetClusterByID, s, IsSSLEnabled())
+	testStatusIntegration(t, c.ID, clusterSvc, clusterSvc.GetClusterByID, IsSSLEnabled())
 }
 
 func TestStatusWithCQLCredentialsIntegration(t *testing.T) {
@@ -188,8 +183,7 @@ func TestStatusWithCQLCredentialsIntegration(t *testing.T) {
 	session := CreateScyllaManagerDBSession(t)
 	defer session.Close()
 
-	s := store.NewTableStore(session, table.Secrets)
-	clusterSvc, err := cluster.NewService(session, metrics.NewClusterMetrics(), s, scyllaclient.DefaultTimeoutConfig(),
+	clusterSvc, err := cluster.NewService(session, metrics.NewClusterMetrics(), scyllaclient.DefaultTimeoutConfig(),
 		15*time.Minute, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -208,10 +202,10 @@ func TestStatusWithCQLCredentialsIntegration(t *testing.T) {
 	}
 	configureManagedClusterCredentials(t, clusterSvc, c)
 
-	testStatusIntegration(t, c.ID, clusterSvc, clusterSvc.GetClusterByID, s, IsSSLEnabled())
+	testStatusIntegration(t, c.ID, clusterSvc, clusterSvc.GetClusterByID, IsSSLEnabled())
 }
 
-func testStatusIntegration(t *testing.T, clusterID uuid.UUID, clusterSvc cluster.Servicer, clusterProvider cluster.ProviderFunc, secretsStore store.Store, sslEnabled bool) {
+func testStatusIntegration(t *testing.T, clusterID uuid.UUID, clusterSvc cluster.Servicer, clusterProvider cluster.ProviderFunc, sslEnabled bool) {
 	logger := log.NewDevelopmentWithLevel(zapcore.InfoLevel).Named("healthcheck")
 
 	// Tests here do not test the dynamic t/o functionality
@@ -237,13 +231,12 @@ func testStatusIntegration(t *testing.T, clusterID uuid.UUID, clusterSvc cluster
 		return scyllaclient.NewClient(sc, logger.Named("scylla"))
 	}
 	configCacheSvc := configcache.NewService(configcache.DefaultConfig(), clusterSvc, scyllaClientProvider,
-		secretsStore, logger.Named("config-cache"))
+		logger.Named("config-cache"))
 	configCacheSvc.Init(context.Background())
 
 	s, err := NewService(
 		c,
 		scyllaClientProvider,
-		secretsStore,
 		clusterProvider,
 		configCacheSvc,
 		logger,

@@ -142,6 +142,7 @@ func (s *Service) targetFromProperties(ctx context.Context, clusterID uuid.UUID,
 	if err != nil {
 		return Target{}, errors.Wrapf(err, "get client")
 	}
+	ctx = cluster.WithExpectedConnectionGeneration(ctx, client.Config().ConnectionGeneration)
 
 	dcMap, err := client.Datacenters(ctx)
 	if err != nil {
@@ -218,7 +219,11 @@ func (s *Service) targetFromProperties(ctx context.Context, clusterID uuid.UUID,
 		},
 	}
 
-	return p.toTarget(ctx, client, dcs, liveNodes, filters, validators)
+	target, err := p.toTarget(ctx, client, dcs, liveNodes, filters, validators)
+	if err == nil {
+		target.connectionGeneration = client.Config().ConnectionGeneration
+	}
+	return target, err
 }
 
 // getLiveNodes returns live nodes of specified datacenters.
@@ -310,6 +315,9 @@ func (s *Service) validateHostNativeBackupSupport(ctx context.Context, clusterID
 	if err != nil {
 		return errors.Wrap(err, "read all nodes config")
 	}
+	if err := configcache.ValidateExpectedConnectionGeneration(ctx, rawNodeConfig); err != nil {
+		return errors.Wrap(err, "read one connection generation")
+	}
 	nodeConfig, err := maps.MapKeyWithError(rawNodeConfig, netip.ParseAddr)
 	if err != nil {
 		return errors.Wrap(err, "parse node config IP address")
@@ -334,6 +342,13 @@ func (s *Service) GetTargetSize(ctx context.Context, clusterID uuid.UUID, target
 	if err != nil {
 		return 0, errors.Wrapf(err, "get client")
 	}
+	if target.connectionGeneration == uuid.Nil || client.Config().ConnectionGeneration == uuid.Nil ||
+		target.connectionGeneration != client.Config().ConnectionGeneration {
+		return 0, errors.Wrapf(cluster.ErrConnectionCommitConflict,
+			"backup target generation %s, active generation %s; regenerate the complete target",
+			target.connectionGeneration, client.Config().ConnectionGeneration)
+	}
+	ctx = cluster.WithExpectedConnectionGeneration(ctx, client.Config().ConnectionGeneration)
 
 	// Get hosts in the given DCs
 	hosts := target.liveNodes.Datacenter(target.DC).Hosts()
@@ -663,6 +678,21 @@ func (s *Service) Backup(ctx context.Context, clusterID, taskID, runID uuid.UUID
 		"target", target,
 	)
 
+	// Pin the active generation before deriving or persisting any run state.
+	// In particular, a stale target must not cause even local backup side
+	// effects before its A-derived endpoints are rejected against B.
+	client, err := s.scyllaClient(ctx, run.ClusterID)
+	if err != nil {
+		return errors.Wrap(err, "initialize: get client proxy")
+	}
+	if target.connectionGeneration == uuid.Nil || client.Config().ConnectionGeneration == uuid.Nil ||
+		target.connectionGeneration != client.Config().ConnectionGeneration {
+		return errors.Wrapf(cluster.ErrConnectionCommitConflict,
+			"backup target generation %s, active generation %s; regenerate the complete target",
+			target.connectionGeneration, client.Config().ConnectionGeneration)
+	}
+	ctx = cluster.WithExpectedConnectionGeneration(ctx, client.Config().ConnectionGeneration)
+
 	if target.Continue {
 		if err := s.decorateWithPrevRun(ctx, run); err != nil {
 			return err
@@ -679,12 +709,6 @@ func (s *Service) Backup(ctx context.Context, clusterID, taskID, runID uuid.UUID
 	// Generate snapshot tag
 	if run.SnapshotTag == "" {
 		run.SnapshotTag = NewSnapshotTag()
-	}
-
-	// Get the cluster client
-	client, err := s.scyllaClient(ctx, run.ClusterID)
-	if err != nil {
-		return errors.Wrap(err, "initialize: get client proxy")
 	}
 
 	// Get live nodes
@@ -711,6 +735,9 @@ func (s *Service) Backup(ctx context.Context, clusterID, taskID, runID uuid.UUID
 	rawNodeConfig, err := s.configCache.ReadAll(clusterID)
 	if err != nil {
 		return errors.Wrap(err, "read all nodes config")
+	}
+	if err := configcache.ValidateExpectedConnectionGeneration(ctx, rawNodeConfig); err != nil {
+		return errors.Wrap(err, "read one connection generation")
 	}
 	nodeConfig, err := maps.MapKeyWithError(rawNodeConfig, netip.ParseAddr)
 	if err != nil {

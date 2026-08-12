@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -85,22 +86,26 @@ type Servicer interface {
 
 // Service manages cluster configurations.
 type Service struct {
-	// mutationMu serializes row and secret mutations so concurrent rotations
-	// cannot interleave into a bundle that neither caller preflighted. This is
-	// process-local; the secure deployment contract is one Manager writer.
-	mutationMu          sync.Mutex
-	session             gocqlx.Session
-	metrics             metrics.ClusterMetrics
-	secretsStore        store.Store
-	clientCache         *scyllaclient.CachedProvider
-	timeoutConfig       scyllaclient.TimeoutConfig
-	logger              log.Logger
-	onChangeListener    func(ctx context.Context, c Change) error
-	cqlQueryPing        func(context.Context, cqlping.Config, string, string) (time.Duration, error)
-	alternatorQueryPing func(context.Context, dynamoping.Config) (time.Duration, error)
+	// mutationMu reduces same-process contention. Correctness across Manager
+	// replicas comes from immutable staging and the global-serial pointer LWT.
+	mutationMu               sync.Mutex
+	session                  gocqlx.Session
+	metrics                  metrics.ClusterMetrics
+	connectionBundleStore    store.Store
+	clientCache              *scyllaclient.CachedProvider
+	timeoutConfig            scyllaclient.TimeoutConfig
+	logger                   log.Logger
+	onChangeListener         func(ctx context.Context, c Change) error
+	onConnectionInvalidation func(clusterID uuid.UUID)
+	stageConnectionBundle    func(context.Context, *secrets.ConnectionBundle) error
+	swapConnectionGeneration func(context.Context, *Cluster, uuid.UUID, bool) error
+	postCommitSession        func(context.Context, uuid.UUID) (gocqlx.Session, error)
+	cqlQueryPing             func(context.Context, cqlping.Config, string, string) (time.Duration, error)
+	cqlNativePing            func(context.Context, cqlping.Config) (time.Duration, error)
+	alternatorQueryPing      func(context.Context, dynamoping.Config) (time.Duration, error)
 }
 
-func NewService(session gocqlx.Session, metrics metrics.ClusterMetrics, secretsStore store.Store, timeoutConfig scyllaclient.TimeoutConfig,
+func NewService(session gocqlx.Session, metrics metrics.ClusterMetrics, timeoutConfig scyllaclient.TimeoutConfig,
 	cacheInvalidationTimeout time.Duration, l log.Logger,
 ) (*Service, error) {
 	if session.Session == nil || session.Closed() {
@@ -110,13 +115,17 @@ func NewService(session gocqlx.Session, metrics metrics.ClusterMetrics, secretsS
 	s := &Service{
 		session:             session,
 		metrics:             metrics,
-		secretsStore:        secretsStore,
 		logger:              l,
 		timeoutConfig:       timeoutConfig,
 		cqlQueryPing:        cqlping.QueryPing,
 		alternatorQueryPing: dynamoping.QueryPing,
 	}
 	s.clientCache = scyllaclient.NewCachedProvider(s.CreateClientNoCache, cacheInvalidationTimeout, l)
+	s.stageConnectionBundle = s.stageImmutableConnectionBundle
+	s.swapConnectionGeneration = s.compareAndSwapConnectionGeneration
+	s.cqlNativePing = func(ctx context.Context, cfg cqlping.Config) (time.Duration, error) {
+		return cqlping.NativeCQLPing(ctx, cfg, s.logger)
+	}
 
 	return s, nil
 }
@@ -124,16 +133,67 @@ func NewService(session gocqlx.Session, metrics metrics.ClusterMetrics, secretsS
 // Init initializes metrics from database.
 func (s *Service) Init(ctx context.Context) error {
 	s.logger.Debug(ctx, "Init")
-
-	var clusters []*Cluster
-	if err := s.session.Query(table.Cluster.SelectAll()).SelectRelease(&clusters); err != nil {
+	if err := s.requireGreenfieldLegacyTablesEmpty(ctx); err != nil {
 		return err
 	}
 
-	for _, c := range clusters {
-		s.metrics.SetName(c.ID, c.Name)
+	var secureClusters []*Cluster
+	if err := s.session.Query(table.Cluster.SelectAll()).SelectRelease(&secureClusters); err != nil {
+		return err
+	}
+	byID := make(map[uuid.UUID]*Cluster, len(secureClusters))
+	for _, scanned := range secureClusters {
+		// SERIAL reads are single-partition only. The range scan discovers IDs;
+		// this point read authoritatively resolves the current pointer/epoch.
+		var c Cluster
+		if err := table.Cluster.GetQueryContext(ctx, s.session).Consistency(gocql.Serial).
+			BindMap(qb.M{"id": scanned.ID}).GetRelease(&c); err != nil {
+			if errors.Is(err, util.ErrNotFound) {
+				continue
+			}
+			return errors.Wrapf(err, "resolve secure cluster %s", scanned.ID)
+		}
+		if err := s.hydrateClusterConnection(&c); err != nil {
+			return errors.Wrapf(err, "hydrate secure connection generation for cluster %s", c.ID)
+		}
+		byID[c.ID] = &c
 	}
 
+	for _, c := range byID {
+		if c.ConnectionDeleted {
+			if s.clientCache != nil {
+				s.clientCache.RevokeClusterEpoch(c.ID, c.ConnectionGeneration, c.LifecycleEpoch)
+			}
+			continue
+		}
+		if s.clientCache != nil {
+			s.clientCache.ResetClusterEpoch(c.ID, c.ConnectionGeneration, c.LifecycleEpoch)
+		}
+		s.metrics.SetName(c.ID, c.Name)
+	}
+	return nil
+}
+
+func (s *Service) requireGreenfieldLegacyTablesEmpty(ctx context.Context) error {
+	checks := []struct {
+		query string
+		name  string
+	}{
+		{query: "SELECT id FROM cluster LIMIT 1", name: "legacy cluster"},
+		{query: "SELECT cluster_id FROM secrets LIMIT 1", name: "legacy generic-secrets"},
+	}
+	for _, check := range checks {
+		var id uuid.UUID
+		err := s.session.ContextQuery(ctx, check.query, nil).Consistency(gocql.All).GetRelease(&id)
+		switch {
+		case err == nil:
+			return errors.Errorf("%s data exists; this secure Manager build supports only a fresh metadata store", check.name)
+		case errors.Is(err, util.ErrNotFound):
+			continue
+		default:
+			return errors.Wrapf(err, "verify %s table is empty", check.name)
+		}
+	}
 	return nil
 }
 
@@ -143,10 +203,60 @@ func (s *Service) SetOnChangeListener(f func(ctx context.Context, c Change) erro
 	s.onChangeListener = f
 }
 
+// SetOnConnectionInvalidationListener installs the synchronous fail-closed
+// cache hook run immediately before a connection generation is switched.
+func (s *Service) SetOnConnectionInvalidationListener(f func(clusterID uuid.UUID)) {
+	s.onConnectionInvalidation = f
+}
+
 // Client is cluster client provider.
 func (s *Service) Client(ctx context.Context, clusterID uuid.UUID) (*scyllaclient.Client, error) {
 	s.logger.Debug(ctx, "Client", "cluster_id", clusterID)
-	return s.clientCache.Client(ctx, clusterID)
+	c, err := s.GetClusterByID(ctx, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	client, err := s.clientCache.ClientForGenerationValidatedEpoch(ctx, clusterID, c.ConnectionGeneration, c.LifecycleEpoch,
+		func() (*scyllaclient.Client, error) {
+			return s.createClientFromCluster(c)
+		},
+		func() error {
+			return s.validateActiveConnectionGeneration(ctx, clusterID, c.ConnectionGeneration, c.LifecycleEpoch)
+		},
+	)
+	if !errors.Is(err, scyllaclient.ErrCachedHostsChanged) {
+		return client, err
+	}
+	// Host topology is part of the immutable connection snapshot. Refresh it
+	// outside the provider cell lock, commit a new generation, then retry the
+	// normal cache acquisition. The temporary discovery client is never handed
+	// to a cache-owned caller.
+	discoveryClient, refreshErr := s.CreateClientNoCache(ctx, clusterID)
+	if discoveryClient != nil {
+		_ = discoveryClient.Close()
+	}
+	if refreshErr != nil {
+		return nil, refreshErr
+	}
+	// Discovery can legitimately confirm that the stored sorted live-host set
+	// is unchanged even though CheckHostsChanged observed a transient topology
+	// difference. Reset the reusable A cell before retrying to avoid recursion.
+	s.clientCache.RefreshGeneration(clusterID, c.ConnectionGeneration)
+	return s.Client(ctx, clusterID)
+}
+
+func (s *Service) validateActiveConnectionGeneration(ctx context.Context, clusterID, generation uuid.UUID, lifecycleEpoch int64) error {
+	var active connectionPointer
+	err := table.Cluster.GetQueryContext(ctx, s.session, "connection_generation", "connection_deleted", "lifecycle_epoch").BindMap(qb.M{
+		"id": clusterID,
+	}).Consistency(gocql.Serial).GetRelease(&active)
+	if err != nil {
+		return errors.Wrap(err, "validate active connection generation")
+	}
+	if active.Generation != generation || active.Epoch != lifecycleEpoch || active.Deleted {
+		return errors.Wrapf(ErrConnectionCommitConflict, "expected active generation %s at lifecycle epoch %d, got generation %s epoch %d deleted=%v", generation, lifecycleEpoch, active.Generation, active.Epoch, active.Deleted)
+	}
+	return nil
 }
 
 // CreateClientNoCache creates Scylla API that load balances calls to every node from given cluster.
@@ -164,10 +274,35 @@ func (s *Service) CreateClientNoCache(ctx context.Context, clusterID uuid.UUID) 
 		return nil, err
 	}
 
-	if err := s.discoverAndSetClusterHosts(ctx, c); err != nil {
-		return nil, errors.Wrap(err, "discover and set cluster hosts")
+	client, err := s.createClientFromCluster(c)
+	if err != nil {
+		return nil, err
 	}
+	liveHosts, err := client.GossiperEndpointLiveGet(ctx)
+	if err != nil {
+		client.Close()
+		return nil, errors.Wrap(err, "discover live Agent hosts")
+	}
+	knownHosts, err := s.discoverHosts(ctx, client, liveHosts)
+	if err != nil {
+		client.Close()
+		return nil, errors.Wrap(err, "discover Agent hosts")
+	}
+	if slices.Equal(knownHosts, c.KnownHosts) {
+		return client, nil
+	}
+	client.Close()
+	if err := s.rotateKnownHosts(ctx, c, knownHosts); err != nil && !errors.Is(err, ErrConnectionCommitConflict) {
+		return nil, errors.Wrap(err, "commit discovered hosts connection generation")
+	}
+	current, err := s.GetClusterByID(ctx, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	return s.createClientFromCluster(current)
+}
 
+func (s *Service) createClientFromCluster(c *Cluster) (*scyllaclient.Client, error) {
 	config, err := s.clientConfig(c)
 	if err != nil {
 		return nil, err
@@ -175,8 +310,58 @@ func (s *Service) CreateClientNoCache(ctx context.Context, clusterID uuid.UUID) 
 	return scyllaclient.NewClient(config, s.logger.Named("client"))
 }
 
+func (s *Service) rotateKnownHosts(ctx context.Context, current *Cluster, hosts []string) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	// Refetch after taking the process-local contention lock. The LWT below is
+	// still the correctness boundary across Manager replicas.
+	active, err := s.GetClusterByID(ctx, current.ID)
+	if err != nil {
+		return err
+	}
+	if active.ConnectionGeneration != current.ConnectionGeneration {
+		return ErrConnectionCommitConflict
+	}
+	candidate := *active
+	candidate.expectedLifecycleEpoch = &active.LifecycleEpoch
+	candidate.KnownHosts = slices.Clone(hosts)
+	generation, err := uuid.NewRandom()
+	if err != nil {
+		return err
+	}
+	bundle := connectionBundleFromCluster(&candidate, generation)
+	bundle.PreviousGeneration = active.ConnectionGeneration
+	if err := s.commitConnectionGeneration(ctx, &candidate, bundle, active.ConnectionGeneration, false); err != nil {
+		return err
+	}
+	if s.clientCache != nil {
+		s.clientCache.ResetClusterEpoch(candidate.ID, generation, bundle.LifecycleEpoch)
+		s.clientCache.InvalidateGeneration(candidate.ID, active.ConnectionGeneration)
+	}
+	s.invalidateConnectionConfigCache(candidate.ID)
+	if err := s.notifyCommittedChange(ctx, generation, Change{ID: candidate.ID, Type: Update}); err != nil {
+		s.logger.Error(ctx, "KnownHosts generation committed but post-commit refresh failed",
+			"cluster_id", candidate.ID,
+			"generation", generation,
+			"error", err,
+		)
+	}
+	return nil
+}
+
+// CreateClientForClusterSnapshot constructs an Agent client from exactly the
+// supplied immutable connection snapshot without refetching the active row.
+func (s *Service) CreateClientForClusterSnapshot(c *Cluster) (*scyllaclient.Client, error) {
+	return s.createClientFromCluster(c)
+}
+
 func (s *Service) clientConfig(c *Cluster) (scyllaclient.Config, error) {
+	if c.ConnectionDeleted {
+		return scyllaclient.Config{}, util.ErrNotFound
+	}
 	config := scyllaclient.DefaultConfigWithTimeout(s.timeoutConfig)
+	config.ConnectionGeneration = c.ConnectionGeneration
+	config.ConnectionLifecycleEpoch = c.LifecycleEpoch
 	if c.Port != 0 {
 		config.Port = strconv.Itoa(c.Port)
 	}
@@ -213,23 +398,7 @@ func (s *Service) clusterTLSConfig(c *Cluster, protocol string) (*tls.Config, er
 	if len(trust.CA) != 0 || trust.ServerName != "" {
 		return secrets.TLSConfig(trust)
 	}
-	return secrets.LoadTLSConfig(s.secretsStore, trust)
-}
-
-func (s *Service) discoverAndSetClusterHosts(ctx context.Context, c *Cluster) error {
-	knownHosts, _, err := s.discoverClusterHosts(ctx, c)
-	if err != nil {
-		if errors.Is(err, ErrNoValidKnownHost) {
-			s.logger.Error(ctx, "There is no single valid known host for the cluster. "+
-				"Please update it with 'sctool cluster update -h <host>'",
-				"cluster", c.ID,
-				"contact point", c.Host,
-				"discovered hosts", c.KnownHosts,
-			)
-		}
-		return err
-	}
-	return errors.Wrap(s.setKnownHosts(c, knownHosts), "update known_hosts in SM DB")
+	return nil, util.ErrNotFound
 }
 
 const (
@@ -359,18 +528,6 @@ func (s *Service) discoverHosts(ctx context.Context, client *scyllaclient.Client
 	return hosts, nil
 }
 
-func (s *Service) loadKnownHosts(c *Cluster) error {
-	q := table.Cluster.GetQuery(s.session, "known_hosts").BindStruct(c)
-	return q.GetRelease(c)
-}
-
-func (s *Service) setKnownHosts(c *Cluster, hosts []string) error {
-	c.KnownHosts = hosts
-
-	q := table.Cluster.UpdateQuery(s.session, "known_hosts").BindStruct(c)
-	return q.ExecRelease()
-}
-
 // ListClusters returns all the clusters for a given filtering criteria.
 func (s *Service) ListClusters(ctx context.Context, f *Filter) ([]*Cluster, error) {
 	s.logger.Debug(ctx, "ListClusters", "filter", f)
@@ -387,6 +544,27 @@ func (s *Service) ListClusters(ctx context.Context, f *Filter) ([]*Cluster, erro
 	if err := q.Select(&clusters); err != nil {
 		return nil, err
 	}
+	authoritative := clusters[:0]
+	for _, scanned := range clusters {
+		// A range scan is only an ID discovery hint. Resolve every pointer with a
+		// point SERIAL read before returning metadata or letting configcache create
+		// a credential-bearing client from it.
+		var c Cluster
+		err := table.Cluster.GetQueryContext(ctx, s.session).Consistency(gocql.Serial).
+			BindMap(qb.M{"id": scanned.ID}).GetRelease(&c)
+		if errors.Is(err, util.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, errors.Wrapf(err, "resolve secure cluster %s", scanned.ID)
+		}
+		if err := s.hydrateClusterConnection(&c); err != nil {
+			return nil, errors.Wrapf(err, "load connection generation for cluster %s", c.ID)
+		}
+		authoritative = append(authoritative, &c)
+	}
+	clusters = authoritative
+	clusters = slices.DeleteFunc(clusters, func(c *Cluster) bool { return c.ConnectionDeleted })
 
 	sort.Slice(clusters, func(i, j int) bool {
 		return bytes.Compare(clusters[i].ID.Bytes(), clusters[j].ID.Bytes()) < 0
@@ -420,11 +598,15 @@ func (s *Service) GetCluster(ctx context.Context, idOrName string) (*Cluster, er
 // GetClusterByID returns cluster based on ID. If nothing was found
 // scylla-manager.ErrNotFound is returned.
 func (s *Service) GetClusterByID(ctx context.Context, id uuid.UUID) (*Cluster, error) {
+	return s.getClusterByID(ctx, id, false)
+}
+
+func (s *Service) getClusterByID(ctx context.Context, id uuid.UUID, includeDeleted bool) (*Cluster, error) {
 	s.logger.Debug(ctx, "GetClusterByID", "id", id)
 
 	q := table.Cluster.GetQuery(s.session).BindMap(qb.M{
 		"id": id,
-	})
+	}).Consistency(gocql.Serial)
 	defer q.Release()
 
 	if q.Err() != nil {
@@ -433,6 +615,15 @@ func (s *Service) GetClusterByID(ctx context.Context, id uuid.UUID) (*Cluster, e
 
 	var c Cluster
 	if err := q.Get(&c); err != nil {
+		return nil, err
+	}
+	if err := s.hydrateClusterConnection(&c); err != nil {
+		return nil, errors.Wrap(err, "load atomic connection bundle")
+	}
+	if c.ConnectionDeleted && !includeDeleted {
+		return nil, util.ErrNotFound
+	}
+	if err := requireExpectedConnectionGeneration(ctx, &c); err != nil {
 		return nil, err
 	}
 
@@ -480,6 +671,10 @@ func (s *Service) GetClusterName(ctx context.Context, id uuid.UUID) (string, err
 func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
+	return s.putClusterLocked(ctx, c)
+}
+
+func (s *Service) putClusterLocked(ctx context.Context, c *Cluster) (err error) {
 
 	if c == nil {
 		return util.ErrNilPtr
@@ -491,10 +686,30 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 		return errors.Wrap(err, "check for cluster creation or update")
 	}
 
+	var old *Cluster
+	var activeBundle *secrets.ConnectionBundle
 	if t == Create {
 		s.logger.Info(ctx, "Adding new cluster", "cluster_id", c.ID)
+		c.LifecycleEpoch = 1
 	} else {
 		s.logger.Info(ctx, "Updating cluster", "cluster_id", c.ID)
+		old, err = s.getClusterByID(ctx, c.ID, true)
+		if err != nil {
+			return err
+		}
+		if err := c.requireExpectedLifecycleEpoch(ctx, old.LifecycleEpoch); err != nil {
+			return err
+		}
+		if old.ConnectionDeleted {
+			return util.ErrValidate(errors.New("deleted secure cluster IDs are permanently retired; enroll the cluster with a new ID"))
+		}
+		// Every update LWT includes this exact lifecycle precondition. It is
+		// assigned only after the request-admission epoch has been checked.
+		c.expectedLifecycleEpoch = &old.LifecycleEpoch
+		c.LifecycleEpoch = old.LifecycleEpoch
+		activeBundle = connectionBundleFromCluster(old, old.ConnectionGeneration)
+		mergeClusterConnection(c, activeBundle)
+		c.ConnectionDeleted = false
 		// Putting cluster should theoretically just set cluster state to the provided one.
 		// The problem is that Cluster.KnownHosts are not part of REST API definitions,
 		// so it's possible that cluster passed to PutCluster doesn't have it set by accident.
@@ -502,9 +717,7 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 		// to be empty (they should at least contain resolved Cluster.Host), we can add additional
 		// safety net here and load them if they are missing.
 		if len(c.KnownHosts) == 0 {
-			if err := s.loadKnownHosts(c); err != nil && !errors.Is(err, gocql.ErrNotFound) {
-				return errors.Wrap(err, "load known hosts")
-			}
+			c.KnownHosts = append([]string(nil), old.KnownHosts...)
 		}
 	}
 
@@ -515,17 +728,8 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 	if t == Create && (len(c.AgentCAFile) == 0 || c.AgentServerName == "") {
 		return util.ErrValidate(errors.New("Agent CA file and server name are required when creating a cluster"))
 	}
-	if t == Create {
-		if err := s.ensureNoStoredSecretsOnCreate(c.ID); err != nil {
-			return err
-		}
-	}
 	if c.ForceTLSDisabled {
-		configured, err := s.CheckTLSTrust(c.ID, secrets.CQLProtocol)
-		if err != nil {
-			return errors.Wrap(err, "check CQL TLS trust")
-		}
-		if configured {
+		if len(c.CQLCAFile) != 0 || c.CQLServerName != "" {
 			return util.ErrValidate(errors.New("force TLS disabled conflicts with stored CQL TLS trust"))
 		}
 	}
@@ -538,10 +742,6 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 	// Check if host connectivity should be checked
 	shouldValidateHostsConnectivity := true
 	if t == Update {
-		old, err := s.GetClusterByID(ctx, c.ID)
-		if err != nil {
-			return err
-		}
 		shouldValidateHostsConnectivity = shouldValidateHostsConnectivityOnUpdate(c, old)
 	}
 
@@ -562,89 +762,50 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 			return err
 		}
 	}
-
-	// Rollback on error.
-	var rollback []func() error
-	defer func() {
-		if err != nil {
-			for i := len(rollback) - 1; i >= 0; i-- {
-				r := rollback[i]
-				if r != nil {
-					if rollbackErr := r(); rollbackErr != nil {
-						s.logger.Error(ctx, "Failed to roll back cluster secret mutation", "cluster_id", c.ID, "error", rollbackErr)
-						err = multierr.Append(err, errors.Wrap(rollbackErr, "roll back cluster secret mutation"))
-					}
-				}
-			}
-		}
-	}()
-
-	if len(c.SSLUserCertFile) != 0 && len(c.SSLUserKeyFile) != 0 {
-		r, err := store.PutWithRollback(s.secretsStore, &secrets.TLSIdentity{
-			ClusterID:  c.ID,
-			Cert:       c.SSLUserCertFile,
-			PrivateKey: c.SSLUserKeyFile,
-		})
-		if err != nil {
-			return errors.Wrap(err, "save SSL cert file")
-		}
-		rollback = append(rollback, r)
+	generation, err := uuid.NewRandom()
+	if err != nil {
+		return errors.Wrap(err, "generate connection generation")
 	}
-
-	if c.Username != "" {
-		r, err := store.PutWithRollback(s.secretsStore, &secrets.CQLCreds{
-			ClusterID: c.ID,
-			Username:  c.Username,
-			Password:  c.Password,
-		})
-		if err != nil {
-			return errors.Wrap(err, "save CQL credentials")
-		}
-		rollback = append(rollback, r)
+	expected := uuid.Nil
+	if old != nil {
+		expected = old.ConnectionGeneration
 	}
-
-	if c.AlternatorAccessKeyID != "" {
-		r, err := store.PutWithRollback(s.secretsStore, &secrets.AlternatorCreds{
-			ClusterID:       c.ID,
-			AccessKeyID:     c.AlternatorAccessKeyID,
-			SecretAccessKey: c.AlternatorSecretAccessKey,
-		})
-		if err != nil {
-			return errors.Wrap(err, "save alternator credentials")
-		}
-		rollback = append(rollback, r)
+	bundle := connectionBundleFromCluster(c, generation)
+	bundle.PreviousGeneration = expected
+	if err := bundle.Validate(); err != nil {
+		return util.ErrValidate(err)
 	}
-
-	for _, trust := range clusterTLSTrustEntries(c) {
-		r, err := store.PutWithRollback(s.secretsStore, trust)
-		if err != nil {
-			return errors.Wrapf(err, "save %s TLS trust", trust.Protocol)
-		}
-		rollback = append(rollback, r)
-	}
-
-	q := table.Cluster.InsertQuery(s.session).BindStruct(c)
-
-	if err := q.ExecRelease(); err != nil {
+	if err := s.commitConnectionGeneration(ctx, c, bundle, expected, t == Create); err != nil {
 		return err
 	}
-	// The cluster row and its secrets now represent one committed state. A
-	// downstream cache or scheduler notification failure must not roll back only
-	// the secrets while leaving the database row behind.
-	rollback = nil
+	if s.clientCache != nil {
+		s.clientCache.ResetClusterEpoch(c.ID, generation, bundle.LifecycleEpoch)
+		if t != Create {
+			s.clientCache.InvalidateGeneration(c.ID, expected)
+		}
+	}
+	// The LWT is the activation point. New Agent acquisitions are keyed by the
+	// new generation, while a reader that captured the immutable old generation
+	// may finish. Remove only the ID-scoped NodeConfig cache now; it will be
+	// rebuilt from the newly active snapshot by the listener below.
+	s.invalidateConnectionConfigCache(c.ID)
 
-	// Secrets and the cluster row are now committed. Retire cached Agent
-	// transports immediately, and let the listener invalidate/rebuild the node
-	// configuration cache before any potentially slow post-commit network work.
-	// This closes the window in which a rotated CA, token, or client identity
-	// could coexist with a usable old cached client/configuration.
-	s.clientCache.Invalidate(c.ID)
 	changeEvent := Change{
 		ID:            c.ID,
 		Type:          t,
 		WithoutRepair: c.WithoutRepair,
 	}
-	listenerErr := s.notifyChangeListener(ctx, changeEvent)
+	listenerErr, sessionErr := s.reconcileCommittedConnection(ctx, generation, changeEvent)
+	if listenerErr != nil {
+		// The LWT above is the commit point and cannot be rolled back. Cache
+		// refresh failure is fail-closed and operationally visible, but reporting
+		// the PUT as uncommitted would invite an unsafe blind retry.
+		s.logger.Error(ctx, "Connection generation committed but post-commit refresh failed",
+			"cluster_id", c.ID,
+			"generation", generation,
+			"error", listenerErr,
+		)
+	}
 
 	if c.AuthToken == "" {
 		s.logger.Info(ctx, "WARNING! Scylla data is exposed on hosts, "+
@@ -654,13 +815,9 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 		)
 	}
 
-	// Create the session and log error
-	session, err := s.GetSession(ctx, c.ID)
-	if err != nil {
+	if sessionErr != nil {
 		s.logger.Info(ctx, "WARNING! Cannot create CQL session to the cluster. It will affect backup/restore/healthcheck services.",
 			"cluster_id", c.ID)
-	} else {
-		session.Close()
 	}
 
 	switch t {
@@ -671,43 +828,6 @@ func (s *Service) PutCluster(ctx context.Context, c *Cluster) (err error) {
 	}
 
 	s.metrics.SetName(c.ID, c.Name)
-	return listenerErr
-}
-
-func clusterTLSTrustEntries(c *Cluster) []*secrets.TLSTrust {
-	entries := make([]*secrets.TLSTrust, 0, 3)
-	appendTrust := func(trust *secrets.TLSTrust, ca []byte, serverName string) {
-		if len(ca) == 0 && serverName == "" {
-			return
-		}
-		trust.CA = ca
-		trust.ServerName = serverName
-		entries = append(entries, trust)
-	}
-	appendTrust(secrets.NewCQLTLSTrust(c.ID), c.CQLCAFile, c.CQLServerName)
-	appendTrust(secrets.NewAlternatorTLSTrust(c.ID), c.AlternatorCAFile, c.AlternatorServerName)
-	appendTrust(secrets.NewAgentTLSTrust(c.ID), c.AgentCAFile, c.AgentServerName)
-	return entries
-}
-
-func (s *Service) ensureNoStoredSecretsOnCreate(clusterID uuid.UUID) error {
-	entries := []store.Entry{
-		&secrets.CQLCreds{ClusterID: clusterID},
-		&secrets.AlternatorCreds{ClusterID: clusterID},
-		&secrets.TLSIdentity{ClusterID: clusterID},
-		secrets.NewCQLTLSTrust(clusterID),
-		secrets.NewAlternatorTLSTrust(clusterID),
-		secrets.NewAgentTLSTrust(clusterID),
-	}
-	for _, entry := range entries {
-		configured, err := s.secretsStore.Check(entry)
-		if err != nil {
-			return errors.Wrap(err, "check for orphaned cluster secrets")
-		}
-		if configured {
-			return util.ErrValidate(errors.New("the requested cluster ID has orphaned secrets; clean them up or use a fresh ID"))
-		}
-	}
 	return nil
 }
 
@@ -726,7 +846,9 @@ func (s *Service) choosePutClusterChangeType(ctx context.Context, c *Cluster) (C
 	}
 
 	// Handle cluster with predesignated ID
-	_, err := s.GetClusterByID(ctx, c.ID)
+	var existingID uuid.UUID
+	err := table.Cluster.GetQueryContext(ctx, s.session, "id").Consistency(gocql.Serial).
+		BindMap(qb.M{"id": c.ID}).GetRelease(&existingID)
 	switch {
 	case err == nil:
 		return Update, nil
@@ -777,10 +899,6 @@ func (s *Service) ValidateHostsConnectivity(ctx context.Context, c *Cluster) err
 }
 
 func (s *Service) validateHostsConnectivity(ctx context.Context, c *Cluster, requireInlineSecrets bool) error {
-	if err := s.loadKnownHosts(c); err != nil && !errors.Is(err, gocql.ErrNotFound) {
-		return errors.Wrap(err, "load known hosts")
-	}
-
 	knownHosts, liveHosts, err := s.discoverClusterHosts(ctx, c)
 	if err != nil {
 		return util.ErrValidate(errors.Wrap(multierr.Append(ErrSecureConnectivity, err), "discover cluster hosts"))
@@ -853,7 +971,11 @@ func (s *Service) validateCQLConnectivity(ctx context.Context, c *Cluster, host 
 		if ni.CqlPasswordProtected || ni.ClientEncryptionRequireAuth {
 			return errors.New("authentication is required without TLS; refusing an unauthenticated or plaintext CQL connection")
 		}
-		return nil
+		_, err := s.runCQLNativePing(ctx, cqlping.Config{
+			Addr:    ni.CQLAddr(host, c.ForceNonSSLSessionPort),
+			Timeout: s.timeoutConfig.Timeout,
+		})
+		return errors.Wrap(err, "verified plaintext query")
 	}
 	if c.ForceTLSDisabled {
 		return errors.New("TLS is advertised but force TLS disabled is set")
@@ -912,7 +1034,11 @@ func (s *Service) validateAlternatorConnectivity(ctx context.Context, c *Cluster
 		if ni.AlternatorEnforceAuthorization {
 			return errors.New("authentication is enabled without TLS; refusing to transmit Alternator credentials over plaintext")
 		}
-		return nil
+		_, err := s.runAlternatorQueryPing(ctx, dynamoping.Config{
+			Addr:    ni.AlternatorAddr(host),
+			Timeout: s.timeoutConfig.Timeout,
+		})
+		return errors.Wrap(err, "verified plaintext query")
 	}
 	if requireInlineSecrets && (len(c.AlternatorCAFile) == 0 || c.AlternatorServerName == "") {
 		return errors.New("TLS is enabled, but Alternator CA file and server name were not supplied for cluster creation")
@@ -948,6 +1074,13 @@ func (s *Service) runCQLQueryPing(ctx context.Context, config cqlping.Config, us
 	return cqlping.QueryPing(ctx, config, username, password)
 }
 
+func (s *Service) runCQLNativePing(ctx context.Context, config cqlping.Config) (time.Duration, error) {
+	if s.cqlNativePing != nil {
+		return s.cqlNativePing(ctx, config)
+	}
+	return cqlping.NativeCQLPing(ctx, config, s.logger)
+}
+
 func (s *Service) runAlternatorQueryPing(ctx context.Context, config dynamoping.Config) (time.Duration, error) {
 	if s.alternatorQueryPing != nil {
 		return s.alternatorQueryPing(ctx, config)
@@ -962,107 +1095,162 @@ func (s *Service) DeleteCluster(ctx context.Context, clusterID uuid.UUID) error 
 
 	s.logger.Debug(ctx, "DeleteCluster", "cluster_id", clusterID)
 
-	q := table.Cluster.DeleteQuery(s.session).BindMap(qb.M{
-		"id": clusterID,
-	})
-
-	if err := q.ExecRelease(); err != nil {
+	active, err := s.getClusterByID(ctx, clusterID, true)
+	if err != nil {
 		return err
 	}
-
-	// The row is gone, so retire all cached authenticated transports and node
-	// configuration before attempting best-effort secret cleanup. A secrets
-	// table failure must not leave a deleted cluster's old bearer token and
-	// pinned trust usable by scheduled work.
-	s.clientCache.Invalidate(clusterID)
-	listenerErr := s.notifyChangeListener(ctx, Change{ID: clusterID, Type: Delete})
-	secretsErr := s.secretsStore.DeleteAll(clusterID)
-	if secretsErr != nil {
-		s.logger.Error(ctx, "Failed to delete cluster secrets",
+	if active.ConnectionDeleted {
+		return util.ErrNotFound
+	}
+	if expected, ok := ExpectedLifecycleEpoch(ctx); ok && expected != active.LifecycleEpoch {
+		return errors.Wrapf(ErrConnectionCommitConflict, "expected lifecycle epoch %d, active lifecycle epoch %d", expected, active.LifecycleEpoch)
+	}
+	generation, err := uuid.NewRandom()
+	if err != nil {
+		return errors.Wrap(err, "generate deleted lifecycle generation")
+	}
+	tombstone := &Cluster{
+		ID:                   clusterID,
+		ConnectionGeneration: generation,
+		ConnectionDeleted:    true,
+		LifecycleEpoch:       active.LifecycleEpoch + 1,
+	}
+	tombstone.expectedLifecycleEpoch = &active.LifecycleEpoch
+	bundle := deletedConnectionBundle(clusterID, generation, active.ConnectionGeneration, tombstone.LifecycleEpoch)
+	if err := s.commitConnectionGeneration(ctx, tombstone, bundle, active.ConnectionGeneration, false); err != nil {
+		if errors.Is(err, ErrConnectionCommitIndeterminate) && s.clientCache != nil {
+			// The outcome cannot be claimed either way. Revoke locally until an
+			// authoritative later PUT/Init reset observes a complete generation.
+			s.clientCache.ProvisionallyRevokeCluster(clusterID, generation)
+			s.invalidateConnectionConfigCache(clusterID)
+		}
+		return err
+	}
+	// The durable tombstone is the delete commit point. Old immutable bundles
+	// are retained for audit/recovery. Secure cluster IDs are never reusable.
+	if s.clientCache != nil {
+		s.clientCache.RevokeClusterEpoch(clusterID, generation, tombstone.LifecycleEpoch)
+	}
+	s.invalidateConnectionConfigCache(clusterID)
+	if err := s.notifyCommittedChange(ctx, generation, Change{ID: clusterID, Type: Delete}); err != nil {
+		s.logger.Error(ctx, "Cluster deletion committed but post-commit cleanup failed",
 			"cluster_id", clusterID,
-			"error", secretsErr,
+			"generation", generation,
+			"error", err,
 		)
 	}
-	return errors.Wrap(multierr.Combine(listenerErr, secretsErr), "delete cluster cleanup")
+	return nil
 }
 
 // CheckCQLCredentials checks if associated CQLCreds exist in secrets store.
 func (s *Service) CheckCQLCredentials(id uuid.UUID) (bool, error) {
-	credentials := secrets.CQLCreds{
-		ClusterID: id,
-	}
-	return s.secretsStore.Check(&credentials)
+	c, err := s.GetClusterByID(context.Background(), id)
+	return c != nil && c.Username != "" && c.Password != "", err
 }
 
 // DeleteCQLCredentials removes the associated CQLCreds from secrets store.
-func (s *Service) DeleteCQLCredentials(_ context.Context, clusterID uuid.UUID) error {
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
-	return s.secretsStore.Delete(&secrets.CQLCreds{
-		ClusterID: clusterID,
-	})
+func (s *Service) DeleteCQLCredentials(ctx context.Context, clusterID uuid.UUID) error {
+	return s.DeleteConnectionSecrets(ctx, clusterID, SecretDeletion{CQLCredentials: true})
 }
 
 // CheckAlternatorCredentials checks if associated AlternatorCreds exist in secrets store.
 func (s *Service) CheckAlternatorCredentials(id uuid.UUID) (bool, error) {
-	credentials := secrets.AlternatorCreds{
-		ClusterID: id,
-	}
-	return s.secretsStore.Check(&credentials)
+	c, err := s.GetClusterByID(context.Background(), id)
+	return c != nil && c.AlternatorAccessKeyID != "" && c.AlternatorSecretAccessKey != "", err
 }
 
 // DeleteAlternatorCredentials removes the associated AlternatorCreds from secrets store.
-func (s *Service) DeleteAlternatorCredentials(_ context.Context, clusterID uuid.UUID) error {
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
-	return s.secretsStore.Delete(&secrets.AlternatorCreds{
-		ClusterID: clusterID,
-	})
+func (s *Service) DeleteAlternatorCredentials(ctx context.Context, clusterID uuid.UUID) error {
+	return s.DeleteConnectionSecrets(ctx, clusterID, SecretDeletion{AlternatorCredentials: true})
 }
 
 // DeleteSSLUserCert removes the associated TLSIdentity from secrets store.
 func (s *Service) DeleteSSLUserCert(ctx context.Context, clusterID uuid.UUID) error {
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
-	if err := s.secretsStore.Delete(&secrets.TLSIdentity{
-		ClusterID: clusterID,
-	}); err != nil {
-		return err
-	}
-	s.clientCache.Invalidate(clusterID)
-	return s.notifyChangeListener(ctx, Change{ID: clusterID, Type: Update})
+	return s.DeleteConnectionSecrets(ctx, clusterID, SecretDeletion{SSLUserCert: true})
 }
 
 // CheckSSLUserCert checks if an associated TLS client identity exists.
 func (s *Service) CheckSSLUserCert(id uuid.UUID) (bool, error) {
-	return s.secretsStore.Check(&secrets.TLSIdentity{ClusterID: id})
+	c, err := s.GetClusterByID(context.Background(), id)
+	return c != nil && len(c.SSLUserCertFile) != 0 && len(c.SSLUserKeyFile) != 0, err
 }
 
 // CheckTLSTrust checks if protocol-specific strict TLS trust exists.
 func (s *Service) CheckTLSTrust(id uuid.UUID, protocol string) (bool, error) {
-	trust, err := tlsTrustEntry(id, protocol)
+	c, err := s.GetClusterByID(context.Background(), id)
 	if err != nil {
 		return false, err
 	}
-	return s.secretsStore.Check(trust)
+	switch protocol {
+	case secrets.CQLProtocol:
+		return len(c.CQLCAFile) != 0 && c.CQLServerName != "", nil
+	case secrets.AlternatorProtocol:
+		return len(c.AlternatorCAFile) != 0 && c.AlternatorServerName != "", nil
+	case secrets.AgentProtocol:
+		return len(c.AgentCAFile) != 0 && c.AgentServerName != "", nil
+	default:
+		return false, util.ErrValidate(errors.Errorf("unsupported TLS protocol %q", protocol))
+	}
 }
 
 // DeleteTLSTrust removes protocol-specific strict TLS trust.
 func (s *Service) DeleteTLSTrust(ctx context.Context, id uuid.UUID, protocol string) error {
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
 	if protocol == secrets.AgentProtocol {
 		return util.ErrValidate(errors.New("Agent TLS trust is mandatory; rotate it through PUT or delete the cluster"))
 	}
-	trust, err := tlsTrustEntry(id, protocol)
+	switch protocol {
+	case secrets.CQLProtocol:
+		return s.DeleteConnectionSecrets(ctx, id, SecretDeletion{CQLTrust: true})
+	case secrets.AlternatorProtocol:
+		return s.DeleteConnectionSecrets(ctx, id, SecretDeletion{AlternatorTrust: true})
+	default:
+		return util.ErrValidate(errors.Errorf("unsupported TLS protocol %q", protocol))
+	}
+}
+
+// DeleteConnectionSecrets clears all selected values in one preflighted,
+// immutable connection generation and one pointer CAS.
+func (s *Service) DeleteConnectionSecrets(ctx context.Context, id uuid.UUID, deletion SecretDeletion) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	c, err := s.GetClusterByID(ctx, id)
 	if err != nil {
 		return err
 	}
-	if err := s.secretsStore.Delete(trust); err != nil {
-		return err
+	if deletion.ExpectedLifecycleEpoch != nil && *deletion.ExpectedLifecycleEpoch != c.LifecycleEpoch {
+		return errors.Wrapf(ErrConnectionCommitConflict, "expected lifecycle epoch %d, active lifecycle epoch %d", *deletion.ExpectedLifecycleEpoch, c.LifecycleEpoch)
 	}
-	s.clientCache.Invalidate(id)
-	return s.notifyChangeListener(ctx, Change{ID: id, Type: Update})
+	if deletion.ExpectedLifecycleEpoch != nil {
+		c.expectedLifecycleEpoch = deletion.ExpectedLifecycleEpoch
+	} else if expected, ok := ExpectedLifecycleEpoch(ctx); ok {
+		c.expectedLifecycleEpoch = &expected
+	}
+	c.deleteCQLCredentials = deletion.CQLCredentials
+	c.deleteAlternatorCredentials = deletion.AlternatorCredentials
+	c.deleteSSLUserCert = deletion.SSLUserCert
+	c.deleteCQLTrust = deletion.CQLTrust
+	c.deleteAlternatorTrust = deletion.AlternatorTrust
+	if deletion.CQLCredentials {
+		c.Username, c.Password = "", ""
+	}
+	if deletion.AlternatorCredentials {
+		c.AlternatorAccessKeyID, c.AlternatorSecretAccessKey = "", ""
+	}
+	if deletion.SSLUserCert {
+		c.SSLUserCertFile, c.SSLUserKeyFile = nil, nil
+	}
+	if deletion.CQLTrust {
+		c.CQLCAFile, c.CQLServerName = nil, ""
+	}
+	if deletion.AlternatorTrust {
+		c.AlternatorCAFile, c.AlternatorServerName = nil, ""
+	}
+	// A remote writer can commit B after the first read. Pin the second
+	// authoritative read in putClusterLocked to A; otherwise public endpoint and
+	// force-policy fields captured in A could be carried across B into C while
+	// only the selected secret is cleared.
+	ctx = WithExpectedConnectionGeneration(ctx, c.ConnectionGeneration)
+	return s.putClusterLocked(ctx, c)
 }
 
 func tlsTrustEntry(id uuid.UUID, protocol string) (*secrets.TLSTrust, error) {
@@ -1159,16 +1347,15 @@ type SessionFunc func(ctx context.Context, clusterID uuid.UUID, opts ...SessionC
 func (s *Service) GetSession(ctx context.Context, clusterID uuid.UUID, opts ...SessionConfigOption) (session gocqlx.Session, err error) {
 	s.logger.Info(ctx, "Get session", "cluster_id", clusterID)
 
-	client, err := s.CreateClientNoCache(ctx, clusterID)
-	if err != nil {
-		return session, errors.Wrap(err, "get client")
-	}
-	defer logutil.LogOnError(ctx, s.logger, client.Close, "Couldn't close scylla client")
-
 	clusterInfo, err := s.GetClusterByID(ctx, clusterID)
 	if err != nil {
 		return session, errors.Wrap(err, "cluster by id")
 	}
+	client, err := s.createClientFromCluster(clusterInfo)
+	if err != nil {
+		return session, errors.Wrap(err, "get client")
+	}
+	defer logutil.LogOnError(ctx, s.logger, client.Close, "Couldn't close scylla client")
 
 	cfg := gocql.NewCluster()
 	for _, opt := range opts {
@@ -1239,14 +1426,7 @@ func (s *Service) cqlCredentialsForCluster(c *Cluster) (username, password strin
 		}
 		return c.Username, c.Password, true, nil
 	}
-	credentials := &secrets.CQLCreds{ClusterID: c.ID}
-	if err := s.secretsStore.Get(credentials); err != nil {
-		if errors.Is(err, util.ErrNotFound) {
-			return "", "", false, nil
-		}
-		return "", "", false, err
-	}
-	return credentials.Username, credentials.Password, true, nil
+	return "", "", false, nil
 }
 
 func (s *Service) extendClusterConfigWithTLS(cluster *Cluster, ni *scyllaclient.NodeInfo, cfg *gocql.ClusterConfig) error {
@@ -1260,7 +1440,7 @@ func (s *Service) extendClusterConfigWithTLS(cluster *Cluster, ni *scyllaclient.
 			EnableHostVerification: true,
 		}
 		if ni.ClientEncryptionRequireAuth {
-			keyPair, err := s.loadTLSIdentity(cluster.ID)
+			keyPair, err := s.tlsIdentityForCluster(cluster)
 			if err != nil {
 				return err
 			}
@@ -1278,16 +1458,21 @@ type AlternatorClientFunc func(ctx context.Context, clusterID uuid.UUID, host st
 func (s *Service) GetAlternatorClient(ctx context.Context, clusterID uuid.UUID, host string) (*dynamodb.Client, error) {
 	s.logger.Info(ctx, "Get Alternator client", "cluster_id", clusterID)
 
-	client, err := s.clientCache.Client(ctx, clusterID)
+	clusterInfo, err := s.GetClusterByID(ctx, clusterID)
+	if err != nil {
+		return nil, errors.Wrap(err, "get cluster")
+	}
+	client, err := s.createClientFromCluster(clusterInfo)
 	if err != nil {
 		return nil, errors.Wrap(err, "get client")
 	}
+	defer logutil.LogOnError(ctx, s.logger, client.Close, "Couldn't close scylla client")
 	ni, err := client.NodeInfo(ctx, host)
 	if err != nil {
 		return nil, errors.Wrapf(err, "get node (%s) info", host)
 	}
 
-	cfg, err := s.alternatorClientConfig(ctx, clusterID, host, ni)
+	cfg, err := s.alternatorClientConfigForCluster(clusterInfo, host, ni)
 	if err != nil {
 		return nil, errors.Wrap(err, "create alternator client config")
 	}
@@ -1303,6 +1488,13 @@ func (s *Service) alternatorClientConfig(ctx context.Context, clusterID uuid.UUI
 	cluster, err := s.GetClusterByID(ctx, clusterID)
 	if err != nil {
 		return aws.Config{}, errors.Wrap(err, "get cluster")
+	}
+	return s.alternatorClientConfigForCluster(cluster, host, ni)
+}
+
+func (s *Service) alternatorClientConfigForCluster(cluster *Cluster, host string, ni *scyllaclient.NodeInfo) (aws.Config, error) {
+	if ni.AlternatorEnforceAuthorization && !ni.AlternatorEncryptionEnabled() {
+		return aws.Config{}, errors.New("Alternator authentication requires verified TLS; refusing to transmit credentials over plaintext")
 	}
 	scCfg, err := s.clientConfig(cluster)
 	if err != nil {
@@ -1333,7 +1525,7 @@ func (s *Service) alternatorClientConfig(ctx context.Context, clusterID uuid.UUI
 	}
 
 	if ni.AlternatorEnforceAuthorization {
-		cfg.Credentials, err = s.alternatorCredentials(clusterID)
+		cfg.Credentials, err = s.alternatorCredentialsForCluster(cluster)
 		if err != nil {
 			return aws.Config{}, errors.Wrap(err, "get alternator credentials")
 		}
@@ -1360,10 +1552,6 @@ func alternatorTransport() *http.Transport {
 var ErrNoAlternatorCredentials = errors.New("cluster requires alternator authentication but they aren't set. " +
 	"Use 'sctool cluster update --alternator-access-key-id --alternator-secret-access-key' for adding them")
 
-func (s *Service) alternatorCredentials(clusterID uuid.UUID) (aws.CredentialsProvider, error) {
-	return s.alternatorCredentialsForCluster(&Cluster{ID: clusterID})
-}
-
 func (s *Service) alternatorCredentialsForCluster(cluster *Cluster) (aws.CredentialsProvider, error) {
 	c := &secrets.AlternatorCreds{
 		ClusterID:       cluster.ID,
@@ -1371,12 +1559,7 @@ func (s *Service) alternatorCredentialsForCluster(cluster *Cluster) (aws.Credent
 		SecretAccessKey: cluster.AlternatorSecretAccessKey,
 	}
 	if c.AccessKeyID == "" && c.SecretAccessKey == "" {
-		if err := s.secretsStore.Get(c); err != nil {
-			if errors.Is(err, util.ErrNotFound) {
-				return nil, ErrNoAlternatorCredentials
-			}
-			return nil, errors.Wrap(err, "get credentials from secrets store")
-		}
+		return nil, ErrNoAlternatorCredentials
 	} else if c.AccessKeyID == "" || c.SecretAccessKey == "" {
 		return nil, util.ErrValidate(errors.New("incomplete Alternator credentials"))
 	}
@@ -1393,10 +1576,6 @@ func (s *Service) alternatorCredentialsForCluster(cluster *Cluster) (aws.Credent
 var ErrNoTLSIdentity = errors.New("cluster requires encryption authentication but TSL/SSL key/cert were not set. " +
 	"Use 'sctool cluster update --ssl-user-key-file --ssl-user-cert-file' for adding them")
 
-func (s *Service) loadTLSIdentity(clusterID uuid.UUID) (tls.Certificate, error) {
-	return s.tlsIdentityForCluster(&Cluster{ID: clusterID})
-}
-
 func (s *Service) tlsIdentityForCluster(cluster *Cluster) (tls.Certificate, error) {
 	tlsIdentity := &secrets.TLSIdentity{
 		ClusterID:  cluster.ID,
@@ -1404,12 +1583,7 @@ func (s *Service) tlsIdentityForCluster(cluster *Cluster) (tls.Certificate, erro
 		PrivateKey: cluster.SSLUserKeyFile,
 	}
 	if len(tlsIdentity.Cert) == 0 && len(tlsIdentity.PrivateKey) == 0 {
-		if err := s.secretsStore.Get(tlsIdentity); err != nil {
-			if errors.Is(err, util.ErrNotFound) {
-				return tls.Certificate{}, ErrNoTLSIdentity
-			}
-			return tls.Certificate{}, errors.Wrap(err, "get TLS/SSL identity")
-		}
+		return tls.Certificate{}, ErrNoTLSIdentity
 	} else if len(tlsIdentity.Cert) == 0 || len(tlsIdentity.PrivateKey) == 0 {
 		return tls.Certificate{}, util.ErrValidate(errors.New("incomplete TLS/SSL identity"))
 	}
@@ -1426,6 +1600,36 @@ func (s *Service) notifyChangeListener(ctx context.Context, c Change) error {
 		return nil
 	}
 	return s.onChangeListener(ctx, c)
+}
+
+func (s *Service) notifyCommittedChange(parent context.Context, generation uuid.UUID, change Change) error {
+	ctx, cancel := s.postCommitConnectionContext(parent, generation)
+	defer cancel()
+	return s.notifyChangeListener(ctx, change)
+}
+
+func (s *Service) reconcileCommittedConnection(parent context.Context, generation uuid.UUID, change Change) (listenerErr, sessionErr error) {
+	ctx, cancel := s.postCommitConnectionContext(parent, generation)
+	defer cancel()
+
+	listenerErr = s.notifyChangeListener(ctx, change)
+	openSession := s.postCommitSession
+	if openSession == nil {
+		openSession = func(ctx context.Context, id uuid.UUID) (gocqlx.Session, error) {
+			return s.GetSession(ctx, id)
+		}
+	}
+	session, sessionErr := openSession(ctx, change.ID)
+	if sessionErr == nil {
+		session.Close()
+	}
+	return listenerErr, sessionErr
+}
+
+func (s *Service) invalidateConnectionConfigCache(clusterID uuid.UUID) {
+	if s.onConnectionInvalidation != nil {
+		s.onConnectionInvalidation(clusterID)
+	}
 }
 
 // Close closes all connections to cluster.

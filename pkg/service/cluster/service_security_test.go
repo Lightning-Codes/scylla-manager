@@ -131,7 +131,6 @@ func TestValidateNodeDataPlaneConnectivityUsesPendingTrustAndCredentials(t *test
 
 	var cqlCalls, alternatorCalls int
 	s := &Service{
-		secretsStore:  securityMemoryStore{},
 		timeoutConfig: scyllaclient.TimeoutConfig{Timeout: time.Second},
 		logger:        log.NewDevelopment(),
 		cqlQueryPing: func(_ context.Context, config cqlping.Config, username, password string) (time.Duration, error) {
@@ -181,7 +180,6 @@ func TestValidateNodeDataPlaneConnectivityFailsClosed(t *testing.T) {
 		AlternatorHTTPSPort:     "8043",
 	}
 	s := &Service{
-		secretsStore:  securityMemoryStore{},
 		timeoutConfig: scyllaclient.TimeoutConfig{Timeout: time.Second},
 		logger:        log.NewDevelopment(),
 		cqlQueryPing: func(context.Context, cqlping.Config, string, string) (time.Duration, error) {
@@ -217,16 +215,20 @@ func TestValidateNodeDataPlaneConnectivityFailsClosed(t *testing.T) {
 	}
 }
 
-func TestValidateNodeDataPlaneConnectivitySkipsUnencryptedEndpoints(t *testing.T) {
+func TestValidateNodeDataPlaneConnectivityProbesUnauthenticatedPlaintextEndpoints(t *testing.T) {
+	var cqlProbes, alternatorProbes int
 	s := &Service{
-		secretsStore: securityMemoryStore{},
+		cqlNativePing: func(context.Context, cqlping.Config) (time.Duration, error) {
+			cqlProbes++
+			return time.Millisecond, nil
+		},
 		cqlQueryPing: func(context.Context, cqlping.Config, string, string) (time.Duration, error) {
-			t.Fatal("CQL secure query unexpectedly ran")
+			t.Fatal("authenticated CQL query unexpectedly ran")
 			return 0, nil
 		},
 		alternatorQueryPing: func(context.Context, dynamoping.Config) (time.Duration, error) {
-			t.Fatal("Alternator secure query unexpectedly ran")
-			return 0, nil
+			alternatorProbes++
+			return time.Millisecond, nil
 		},
 	}
 	if err := s.validateNodeDataPlaneConnectivity(context.Background(), &Cluster{}, "127.0.0.1", &scyllaclient.NodeInfo{
@@ -235,10 +237,21 @@ func TestValidateNodeDataPlaneConnectivitySkipsUnencryptedEndpoints(t *testing.T
 	}, false); err != nil {
 		t.Fatal(err)
 	}
+	if cqlProbes != 1 || alternatorProbes != 1 {
+		t.Fatalf("unexpected plaintext probes: CQL=%d Alternator=%d", cqlProbes, alternatorProbes)
+	}
 }
 
 func TestValidateNodeDataPlaneConnectivityRejectsAuthenticatedPlaintext(t *testing.T) {
-	s := &Service{secretsStore: securityMemoryStore{}}
+	s := &Service{
+		cqlNativePing: func(context.Context, cqlping.Config) (time.Duration, error) {
+			return time.Millisecond, nil
+		},
+		alternatorQueryPing: func(context.Context, dynamoping.Config) (time.Duration, error) {
+			t.Fatal("authenticated plaintext Alternator reached the query")
+			return 0, nil
+		},
+	}
 	for name, ni := range map[string]*scyllaclient.NodeInfo{
 		"CQL": {
 			CqlPasswordProtected: true,
@@ -259,7 +272,7 @@ func TestValidateNodeDataPlaneConnectivityRejectsAuthenticatedPlaintext(t *testi
 }
 
 func TestOperationalClientsNeverLoadCredentialsForPlaintextEndpoints(t *testing.T) {
-	s := &Service{secretsStore: panicGetSecurityStore{securityMemoryStore: securityMemoryStore{}}}
+	s := &Service{}
 
 	cqlConfig := gocql.NewCluster("127.0.0.1")
 	if err := s.extendClusterConfigWithAuthentication(&Cluster{ID: uuid.MustRandom()}, &scyllaclient.NodeInfo{
@@ -276,50 +289,11 @@ func TestOperationalClientsNeverLoadCredentialsForPlaintextEndpoints(t *testing.
 	}
 }
 
-type panicGetSecurityStore struct{ securityMemoryStore }
-
-func (panicGetSecurityStore) Get(store.Entry) error {
-	panic("plaintext operational client attempted to load credentials")
-}
-
 func TestDeleteAgentTLSTrustIsRejectedWithoutMutation(t *testing.T) {
 	id := uuid.MustRandom()
-	trust := secrets.NewAgentTLSTrust(id)
-	trust.CA = mustSecurityTestCA(t)
-	trust.ServerName = "agent.internal"
-	secretsStore := securityMemoryStore{}
-	if err := secretsStore.Put(trust); err != nil {
-		t.Fatal(err)
-	}
-	s := &Service{secretsStore: secretsStore}
+	s := &Service{}
 	if err := s.DeleteTLSTrust(context.Background(), id, secrets.AgentProtocol); !util.IsErrValidate(err) {
 		t.Fatalf("expected mandatory Agent trust validation error, got %v", err)
-	}
-	if configured, err := secretsStore.Check(secrets.NewAgentTLSTrust(id)); err != nil || !configured {
-		t.Fatalf("Agent trust was mutated: configured=%v err=%v", configured, err)
-	}
-}
-
-func TestCreateRejectsOrphanedSecrets(t *testing.T) {
-	id := uuid.MustRandom()
-	for name, entry := range map[string]store.Entry{
-		"CQL credentials":        &secrets.CQLCreds{ClusterID: id, Username: "user", Password: "password"},
-		"Alternator credentials": &secrets.AlternatorCreds{ClusterID: id, AccessKeyID: "access", SecretAccessKey: "secret"},
-		"TLS identity":           &secrets.TLSIdentity{ClusterID: id, Cert: []byte("cert"), PrivateKey: []byte("key")},
-		"CQL trust":              securityTestTrust(t, secrets.NewCQLTLSTrust(id), "cql.internal"),
-		"Alternator trust":       securityTestTrust(t, secrets.NewAlternatorTLSTrust(id), "alternator.internal"),
-		"Agent trust":            securityTestTrust(t, secrets.NewAgentTLSTrust(id), "agent.internal"),
-	} {
-		t.Run(name, func(t *testing.T) {
-			secretsStore := securityMemoryStore{}
-			if err := secretsStore.Put(entry); err != nil {
-				t.Fatal(err)
-			}
-			s := &Service{secretsStore: secretsStore}
-			if err := s.ensureNoStoredSecretsOnCreate(id); !util.IsErrValidate(err) || !strings.Contains(err.Error(), "orphaned secrets") {
-				t.Fatalf("orphaned secret was not rejected: %v", err)
-			}
-		})
 	}
 }
 

@@ -73,23 +73,19 @@ func (s *server) makeServices(ctx context.Context) error {
 	var err error
 
 	drawerStore := store.NewTableStore(s.session, table.Drawer)
-	secretsStore := store.NewTableStore(s.session, table.Secrets)
-
-	s.clusterSvc, err = cluster.NewService(s.session, metrics.NewClusterMetrics().MustRegister(), secretsStore, s.config.TimeoutConfig,
+	s.clusterSvc, err = cluster.NewService(s.session, metrics.NewClusterMetrics().MustRegister(), s.config.TimeoutConfig,
 		s.config.ClientCacheTimeout, s.logger.Named("cluster"))
 	if err != nil {
 		return errors.Wrapf(err, "cluster service")
 	}
 	s.clusterSvc.SetOnChangeListener(s.onClusterChange)
 
-	s.configCacheSvc = configcache.NewService(s.config.ConfigCache, s.clusterSvc, s.clusterSvc.CreateClientNoCache,
-		secretsStore, s.logger)
-	s.initConfigCacheSvc(ctx)
+	s.configCacheSvc = configcache.NewService(s.config.ConfigCache, s.clusterSvc, s.clusterSvc.CreateClientNoCache, s.logger)
+	s.clusterSvc.SetOnConnectionInvalidationListener(s.configCacheSvc.RemoveCluster)
 
 	s.healthSvc, err = healthcheck.NewService(
 		s.config.Healthcheck,
 		s.clusterSvc.Client,
-		secretsStore,
 		s.clusterSvc.GetClusterByID,
 		s.configCacheSvc,
 		s.logger.Named("healthcheck"),
@@ -364,6 +360,9 @@ func (s *server) startServices(ctx context.Context) error {
 	if err := s.clusterSvc.Init(ctx); err != nil {
 		return errors.Wrap(err, "cluster service")
 	}
+	// The cluster service rejects non-greenfield legacy state before any
+	// configuration cache, scheduler, or HTTP service can consume it.
+	s.initConfigCacheSvc(ctx)
 	// Not being able to update healthcheck tasks is not critical,
 	// so we shouldn't fail service start because of that.
 	if err := s.schedSvc.UpdateHealthcheckTasks(ctx, s.config.Healthcheck); err != nil {

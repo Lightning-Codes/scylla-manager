@@ -45,6 +45,7 @@ type DBConfig struct {
 type SSLConfig struct {
 	CertFile     string `yaml:"cert_file"`
 	Validate     bool   `yaml:"validate"`
+	ServerName   string `yaml:"server_name"`
 	UserCertFile string `yaml:"user_cert_file"`
 	UserKeyFile  string `yaml:"user_key_file"`
 }
@@ -153,9 +154,20 @@ func (c Config) Validate() error {
 		if c.SSL.CertFile == "" {
 			return errors.New("database credentials require ssl.cert_file with the database CA")
 		}
+		if strings.TrimSpace(c.SSL.ServerName) == "" {
+			return errors.New("database credentials require ssl.server_name")
+		}
 	}
 	if (c.SSL.UserCertFile == "") != (c.SSL.UserKeyFile == "") {
 		return errors.New("ssl.user_cert_file and ssl.user_key_file must be configured together")
+	}
+	if c.SSL.UserCertFile != "" {
+		if !c.Database.SSL || !c.SSL.Validate || c.SSL.CertFile == "" || strings.TrimSpace(c.SSL.ServerName) == "" {
+			return errors.New("database client identity requires database.ssl=true, ssl.validate=true, ssl.cert_file, and ssl.server_name")
+		}
+	}
+	if c.SSL.ServerName != "" && (!c.Database.SSL || !c.SSL.Validate) {
+		return errors.New("ssl.server_name requires database.ssl=true and ssl.validate=true")
 	}
 	if err := c.Backup.Validate(); err != nil {
 		return errors.Wrap(err, "backup")

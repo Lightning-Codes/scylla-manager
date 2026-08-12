@@ -11,6 +11,7 @@ import (
 	"github.com/scylladb/gocqlx/v2"
 	"github.com/scylladb/scylla-manager/v3/pkg/metrics"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/uuid"
 )
 
@@ -56,10 +57,23 @@ func (s *Service) Run(ctx context.Context, clusterID, taskID, runID uuid.UUID, p
 	if err != nil {
 		return errors.Wrap(err, "new worker")
 	}
+	if err := validateTargetGeneration(target, w.client); err != nil {
+		return err
+	}
 	if err := w.repairAll(ctx, target); err != nil {
 		return errors.Wrap(err, "repair all tablet tables")
 	}
 	return nil
+}
+
+func validateTargetGeneration(target Target, client *scyllaclient.Client) error {
+	if target.connectionGeneration != uuid.Nil && client.Config().ConnectionGeneration != uuid.Nil &&
+		target.connectionGeneration == client.Config().ConnectionGeneration {
+		return nil
+	}
+	return errors.Wrapf(cluster.ErrConnectionCommitConflict,
+		"tablet repair target generation %s, active generation %s; regenerate the complete target",
+		target.connectionGeneration, client.Config().ConnectionGeneration)
 }
 
 // GetProgress of tablet repair task.

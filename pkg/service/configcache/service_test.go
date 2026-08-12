@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -88,7 +89,6 @@ func TestService_Read(t *testing.T) {
 				svcConfig:    DefaultConfig(),
 				clusterSvc:   &mockClusterServicer{},
 				scyllaClient: mockProviderFunc,
-				secretsStore: &mockStore{},
 				configs:      tc.state,
 				revisions:    &sync.Map{},
 			}
@@ -158,7 +158,6 @@ func TestService_AvailableHosts(t *testing.T) {
 				svcConfig:    DefaultConfig(),
 				clusterSvc:   &mockClusterServicer{},
 				scyllaClient: mockProviderFunc,
-				secretsStore: &mockStore{},
 				configs:      tc.state,
 				revisions:    &sync.Map{},
 			}
@@ -188,7 +187,6 @@ func TestService_Run(t *testing.T) {
 			svcConfig:    DefaultConfig(),
 			clusterSvc:   &mockClusterServicer{},
 			scyllaClient: mockProviderFunc,
-			secretsStore: &mockStore{},
 			configs:      &sync.Map{},
 			revisions:    &sync.Map{},
 		}
@@ -216,7 +214,6 @@ func TestServiceForceUpdateCluster(t *testing.T) {
 			svcConfig:    DefaultConfig(),
 			clusterSvc:   &mockErrorClusterSvc{},
 			scyllaClient: mockProviderFunc,
-			secretsStore: &mockStore{},
 			configs: convertMapToSyncMap(map[any]any{
 				clusterID.String(): &clusterConfigEntry{configs: convertMapToSyncMap(map[any]any{"host": NodeConfig{}})},
 			}),
@@ -241,7 +238,6 @@ func TestServiceRefreshPublishesAtomically(t *testing.T) {
 		svcConfig:    DefaultConfig(),
 		clusterSvc:   clusterSvc,
 		scyllaClient: noRequestProvider("good", "bad"),
-		secretsStore: &mockStore{},
 		configs: convertMapToSyncMap(map[any]any{
 			clusterID.String(): &clusterConfigEntry{configs: convertMapToSyncMap(map[any]any{"stale": NodeConfig{}})},
 		}),
@@ -274,7 +270,6 @@ func TestServiceSupersededRefreshCannotRepublishOldConfig(t *testing.T) {
 		svcConfig:    DefaultConfig(),
 		clusterSvc:   clusterSvc,
 		scyllaClient: noRequestProvider("host"),
-		secretsStore: &mockStore{},
 		configs:      &sync.Map{},
 		revisions:    &sync.Map{},
 		logger:       log.NewDevelopment(),
@@ -338,7 +333,6 @@ func TestServiceInitInvalidatesInflightRefresh(t *testing.T) {
 		svcConfig:    DefaultConfig(),
 		clusterSvc:   clusterSvc,
 		scyllaClient: noRequestProvider("host"),
-		secretsStore: &mockStore{},
 		configs:      &sync.Map{},
 		revisions:    &sync.Map{},
 		logger:       log.NewDevelopment(),
@@ -371,7 +365,6 @@ func TestServiceUpdateAllRefetchesCurrentCluster(t *testing.T) {
 		svcConfig:    DefaultConfig(),
 		clusterSvc:   clusterSvc,
 		scyllaClient: noRequestProvider("host"),
-		secretsStore: &mockStore{},
 		configs:      &sync.Map{},
 		revisions:    &sync.Map{},
 		logger:       log.NewDevelopment(),
@@ -387,6 +380,163 @@ func TestServiceUpdateAllRefetchesCurrentCluster(t *testing.T) {
 	}
 	if got.AgentVersion != "new" {
 		t.Fatalf("background refresh used stale listed cluster: %q", got.AgentVersion)
+	}
+}
+
+func TestServiceUpdateAllRemovesRemotelyDeletedCluster(t *testing.T) {
+	clusterID := uuid.MustRandom()
+	svc := Service{
+		svcConfig:  DefaultConfig(),
+		clusterSvc: &rotatingClusterServicer{listed: nil},
+		configs: convertMapToSyncMap(map[any]any{
+			clusterID.String(): &clusterConfigEntry{configs: convertMapToSyncMap(map[any]any{
+				"10.0.0.1": NodeConfig{ConnectionGeneration: uuid.MustRandom()},
+			})},
+		}),
+		revisions: &sync.Map{},
+		logger:    log.NewDevelopment(),
+	}
+
+	svc.updateAll(context.Background())
+	if _, err := svc.ReadAll(clusterID); err != ErrNoClusterConfig {
+		t.Fatalf("remote tombstone retained credential-bearing config: %v", err)
+	}
+}
+
+func TestServiceUpdateAllListFailureClearsCredentialCache(t *testing.T) {
+	clusterID := uuid.MustRandom()
+	svc := Service{
+		svcConfig:  DefaultConfig(),
+		clusterSvc: &listErrorClusterServicer{},
+		configs: convertMapToSyncMap(map[any]any{
+			clusterID.String(): &clusterConfigEntry{configs: convertMapToSyncMap(map[any]any{
+				"10.0.0.1": NodeConfig{ConnectionGeneration: uuid.MustRandom(), CQLPassword: "must-be-removed"},
+			})},
+		}),
+		revisions: &sync.Map{},
+		logger:    log.NewDevelopment(),
+	}
+
+	svc.updateAll(context.Background())
+	if _, err := svc.ReadAll(clusterID); err != ErrNoClusterConfig {
+		t.Fatalf("failed authoritative list retained credentials: %v", err)
+	}
+}
+
+func TestServiceAvailableHostsRejectsRemoteGenerationChange(t *testing.T) {
+	clusterID, a, b := uuid.MustRandom(), uuid.MustRandom(), uuid.MustRandom()
+	svc := Service{
+		svcConfig:  DefaultConfig(),
+		clusterSvc: &rotatingClusterServicer{current: &cluster.Cluster{ID: clusterID, ConnectionGeneration: b}},
+		configs: convertMapToSyncMap(map[any]any{
+			clusterID.String(): &clusterConfigEntry{connectionGeneration: a, configs: convertMapToSyncMap(map[any]any{
+				"10.0.0.1": NodeConfig{ConnectionGeneration: a},
+			})},
+		}),
+		revisions: &sync.Map{},
+		logger:    log.NewDevelopment(),
+	}
+
+	if _, err := svc.AvailableHosts(context.Background(), clusterID); !errors.Is(err, cluster.ErrConnectionCommitConflict) {
+		t.Fatalf("mixed remote generation was not rejected: %v", err)
+	}
+	configs, err := svc.ReadAll(clusterID)
+	if err != nil || configs["10.0.0.1"].ConnectionGeneration != a {
+		t.Fatalf("failed caller evicted the cache entry it did not authoritatively own: configs=%#v err=%v", configs, err)
+	}
+}
+
+func TestAvailableHostsStalePointerReadCannotEvictConcurrentGeneration(t *testing.T) {
+	clusterID, a, b := uuid.MustRandom(), uuid.MustRandom(), uuid.MustRandom()
+	svc := Service{
+		svcConfig: DefaultConfig(),
+		configs:   &sync.Map{},
+		revisions: &sync.Map{},
+		logger:    log.NewDevelopment(),
+	}
+	svc.revisions.Store(clusterID.String(), &atomic.Uint64{})
+	svc.clusterSvc = &callbackClusterServicer{get: func(context.Context, string) (*cluster.Cluster, error) {
+		// The point read completed on A, then a concurrent verified refresh
+		// publishes B before AvailableHosts loads the cache entry.
+		svc.configs.Store(clusterID.String(), &clusterConfigEntry{
+			connectionGeneration: b,
+			configs: convertMapToSyncMap(map[any]any{
+				"10.0.0.2": NodeConfig{ConnectionGeneration: b},
+			}),
+		})
+		return &cluster.Cluster{ID: clusterID, ConnectionGeneration: a}, nil
+	}}
+	if _, err := svc.AvailableHosts(context.Background(), clusterID); !errors.Is(err, cluster.ErrConnectionCommitConflict) {
+		t.Fatalf("stale pointer/cache interleaving was accepted: %v", err)
+	}
+	configs, err := svc.ReadAll(clusterID)
+	if err != nil || configs["10.0.0.2"].ConnectionGeneration != b {
+		t.Fatalf("stale A reader evicted concurrent B: configs=%#v err=%v", configs, err)
+	}
+}
+
+func TestStalePinnedRefreshCannotEvictActiveGeneration(t *testing.T) {
+	clusterID, a, b := uuid.MustRandom(), uuid.MustRandom(), uuid.MustRandom()
+	svc := Service{
+		svcConfig:  DefaultConfig(),
+		clusterSvc: &rotatingClusterServicer{current: &cluster.Cluster{ID: clusterID, ConnectionGeneration: b}},
+		configs: convertMapToSyncMap(map[any]any{
+			clusterID.String(): &clusterConfigEntry{configs: convertMapToSyncMap(map[any]any{
+				"10.0.0.1": NodeConfig{ConnectionGeneration: b, AgentAuthToken: "generation-b"},
+			})},
+		}),
+		revisions: &sync.Map{},
+		logger:    log.NewDevelopment(),
+	}
+
+	ctx := cluster.WithExpectedConnectionGeneration(context.Background(), a)
+	if svc.ForceUpdateCluster(ctx, clusterID) {
+		t.Fatal("stale A refresh unexpectedly succeeded after B became active")
+	}
+	got, err := svc.Read(clusterID, "10.0.0.1")
+	if err != nil || got.ConnectionGeneration != b || got.AgentAuthToken != "generation-b" {
+		t.Fatalf("stale A refresh evicted active B cache: config=%#v err=%v", got, err)
+	}
+}
+
+func TestOlderRefreshCannotEvictNewerPublicationAfterAuthoritativeRead(t *testing.T) {
+	clusterID, a, b := uuid.MustRandom(), uuid.MustRandom(), uuid.MustRandom()
+	aRead := make(chan struct{})
+	releaseA := make(chan struct{})
+	var calls atomic.Int32
+	clusterSvc := &callbackClusterServicer{get: func(context.Context, string) (*cluster.Cluster, error) {
+		if calls.Add(1) == 1 {
+			close(aRead)
+			<-releaseA
+			return &cluster.Cluster{ID: clusterID, ConnectionGeneration: a, LifecycleEpoch: 1}, nil
+		}
+		return &cluster.Cluster{ID: clusterID, ConnectionGeneration: b, LifecycleEpoch: 1}, nil
+	}}
+	svc := Service{
+		svcConfig:    DefaultConfig(),
+		clusterSvc:   clusterSvc,
+		scyllaClient: noRequestProvider("host"),
+		configs:      &sync.Map{},
+		revisions:    &sync.Map{},
+		logger:       log.NewDevelopment(),
+		nodeConfigLoader: func(_ context.Context, _ string, _ *scyllaclient.Client, c *cluster.Cluster) (NodeConfig, error) {
+			return NodeConfig{ConnectionGeneration: c.ConnectionGeneration, ConnectionLifecycleEpoch: c.LifecycleEpoch}, nil
+		},
+	}
+
+	aResult := make(chan bool, 1)
+	go func() { aResult <- svc.ForceUpdateCluster(context.Background(), clusterID) }()
+	<-aRead
+	if !svc.ForceUpdateCluster(context.Background(), clusterID) {
+		t.Fatal("newer generation refresh failed")
+	}
+	close(releaseA)
+	if <-aResult {
+		t.Fatal("older authoritative snapshot unexpectedly published")
+	}
+	got, err := svc.Read(clusterID, "host")
+	if err != nil || got.ConnectionGeneration != b {
+		t.Fatalf("older authoritative read left newer cache absent: config=%#v err=%v", got, err)
 	}
 }
 
@@ -434,7 +584,6 @@ func TestService_Read_IPv6Normalization(t *testing.T) {
 		svcConfig:    DefaultConfig(),
 		clusterSvc:   &mockClusterServicer{},
 		scyllaClient: mockProviderFunc,
-		secretsStore: &mockStore{},
 		configs:      initialState,
 		revisions:    &sync.Map{},
 	}
@@ -488,7 +637,11 @@ func (s *mockClusterServicer) ListClusters(ctx context.Context, f *cluster.Filte
 
 // GetCluster mocks the GetCluster method of Servicer.
 func (s *mockClusterServicer) GetCluster(ctx context.Context, idOrName string) (*cluster.Cluster, error) {
-	return nil, nil
+	id, err := uuid.Parse(idOrName)
+	if err != nil {
+		return nil, err
+	}
+	return &cluster.Cluster{ID: id}, nil
 }
 
 // PutCluster mocks the PutCluster method of Servicer.
@@ -574,6 +727,28 @@ type mockErrorClusterSvc struct {
 	mockClusterServicer
 }
 
+type listErrorClusterServicer struct{ mockClusterServicer }
+
+type callbackClusterServicer struct {
+	mockClusterServicer
+	get func(context.Context, string) (*cluster.Cluster, error)
+}
+
+func (s *callbackClusterServicer) GetCluster(ctx context.Context, id string) (*cluster.Cluster, error) {
+	return s.get(ctx, id)
+}
+
+func (*callbackClusterServicer) CreateClientForClusterSnapshot(c *cluster.Cluster) (*scyllaclient.Client, error) {
+	config := scyllaclient.TestConfig([]string{"host"}, "token")
+	config.ConnectionGeneration = c.ConnectionGeneration
+	config.ConnectionLifecycleEpoch = c.LifecycleEpoch
+	return scyllaclient.NewClient(config, log.NewDevelopment())
+}
+
+func (*listErrorClusterServicer) ListClusters(context.Context, *cluster.Filter) ([]*cluster.Cluster, error) {
+	return nil, errors.New("authoritative list unavailable")
+}
+
 // GetCluster mocks the GetCluster method of Servicer with error response.
 func (s *mockErrorClusterSvc) GetCluster(_ context.Context, _ string) (*cluster.Cluster, error) {
 	return nil, errors.New("not found")
@@ -587,9 +762,12 @@ type rotatingClusterServicer struct {
 	listed  []*cluster.Cluster
 }
 
-func (s *rotatingClusterServicer) GetCluster(context.Context, string) (*cluster.Cluster, error) {
+func (s *rotatingClusterServicer) GetCluster(ctx context.Context, _ string) (*cluster.Cluster, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if expected, ok := cluster.ExpectedConnectionGeneration(ctx); ok && expected != s.current.ConnectionGeneration {
+		return nil, cluster.ErrConnectionCommitConflict
+	}
 	c := *s.current
 	return &c, nil
 }

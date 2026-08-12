@@ -16,7 +16,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/scylladb/go-log"
 	"github.com/scylladb/scylla-manager/v3/pkg/restapi"
-	"github.com/scylladb/scylla-manager/v3/pkg/secrets"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/testutils"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/uuid"
@@ -29,19 +28,19 @@ func TestClusterList(t *testing.T) {
 	defer ctrl.Finish()
 
 	id := uuid.MustRandom()
-	stored := []*cluster.Cluster{{ID: id, Name: "name"}}
+	stored := []*cluster.Cluster{{
+		ID: id, Name: "name", Username: "user", Password: "password",
+		AlternatorAccessKeyID: "access", AlternatorSecretAccessKey: "secret",
+		CQLCAFile: []byte("ca"), CQLServerName: "cql",
+		AlternatorCAFile: []byte("ca"), AlternatorServerName: "alternator",
+		AgentCAFile: []byte("ca"), AgentServerName: "agent",
+	}}
 	expected := []*cluster.Cluster{{
 		ID: id, Name: "name", CQLCredentialsSet: true, AlternatorCredentialsSet: true,
 		CQLCASet: true, AlternatorCASet: true, AgentCASet: true,
 	}}
 
 	m := restapi.NewMockClusterService(ctrl)
-	m.EXPECT().CheckCQLCredentials(gomock.Any()).Return(true, nil)
-	m.EXPECT().CheckAlternatorCredentials(gomock.Any()).Return(true, nil)
-	m.EXPECT().CheckSSLUserCert(gomock.Any()).Return(false, nil)
-	m.EXPECT().CheckTLSTrust(gomock.Any(), secrets.CQLProtocol).Return(true, nil)
-	m.EXPECT().CheckTLSTrust(gomock.Any(), secrets.AlternatorProtocol).Return(true, nil)
-	m.EXPECT().CheckTLSTrust(gomock.Any(), secrets.AgentProtocol).Return(true, nil)
 	m.EXPECT().ListClusters(gomock.Any(), &cluster.Filter{}).Return(stored, nil)
 
 	h := restapi.New(restapi.Services{Cluster: m}, log.Logger{})
@@ -104,13 +103,31 @@ func TestClusterCreateWithProvidedID(t *testing.T) {
 	}
 }
 
+func TestClusterRejectsUnknownOrTrailingJSONFields(t *testing.T) {
+	for name, body := range map[string]string{
+		"token typo":     `{"host":"node","auth_t0ken":"secret"}`,
+		"trust typo":     `{"host":"node","agent_servername":"agent.internal"}`,
+		"force typo":     `{"host":"node","force_tls_disable":true}`,
+		"trailing value": `{"host":"node"} {"host":"other"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			m := restapi.NewMockClusterService(ctrl)
+			h := restapi.New(restapi.Services{Cluster: m}, log.Logger{})
+			r := httptest.NewRequest(http.MethodPost, "/api/v1/clusters", strings.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("unsafe JSON was accepted: %d %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 func expectClusterSecretChecks(m *restapi.MockClusterService, id uuid.UUID) {
-	m.EXPECT().CheckCQLCredentials(id).Return(true, nil)
-	m.EXPECT().CheckAlternatorCredentials(id).Return(true, nil)
-	m.EXPECT().CheckSSLUserCert(id).Return(true, nil)
-	m.EXPECT().CheckTLSTrust(id, secrets.CQLProtocol).Return(true, nil)
-	m.EXPECT().CheckTLSTrust(id, secrets.AlternatorProtocol).Return(true, nil)
-	m.EXPECT().CheckTLSTrust(id, secrets.AgentProtocol).Return(true, nil)
+	_ = m
+	_ = id
 }
 
 func TestClusterResponsesAreSanitized(t *testing.T) {
@@ -157,7 +174,7 @@ func TestClusterResponsesAreSanitized(t *testing.T) {
 	}
 }
 
-func TestClusterGetPutRoundTripPreservesAuthToken(t *testing.T) {
+func TestClusterGetPutRoundTripLeavesOmittedAuthTokenForAuthoritativeMerge(t *testing.T) {
 	id := uuid.MustRandom()
 	stored := &cluster.Cluster{ID: id, Name: "old", AuthToken: "agent-token", KnownHosts: []string{"host"}}
 
@@ -167,8 +184,8 @@ func TestClusterGetPutRoundTripPreservesAuthToken(t *testing.T) {
 	expectClusterSecretChecks(m, id)
 	expectClusterSecretChecks(m, id)
 	m.EXPECT().PutCluster(gomock.Any(), gomock.Any()).DoAndReturn(func(_ interface{}, got *cluster.Cluster) error {
-		if got.AuthToken != stored.AuthToken {
-			t.Fatal("GET to PUT round trip cleared auth token")
+		if got.AuthToken != "" || len(got.KnownHosts) != 0 {
+			t.Fatalf("REST injected stale internal fields: %#v", got)
 		}
 		return nil
 	})
@@ -193,7 +210,7 @@ func TestClusterGetPutRoundTripPreservesAuthToken(t *testing.T) {
 	}
 }
 
-func TestClusterUpdatePreservesOmittedAuthTokenAndSanitizesResponse(t *testing.T) {
+func TestClusterUpdateDoesNotInjectOmittedAuthTokenAndSanitizesResponse(t *testing.T) {
 	id := uuid.MustRandom()
 	stored := &cluster.Cluster{ID: id, Name: "old", AuthToken: "agent-token", KnownHosts: []string{"host"}}
 
@@ -201,8 +218,8 @@ func TestClusterUpdatePreservesOmittedAuthTokenAndSanitizesResponse(t *testing.T
 	m := restapi.NewMockClusterService(ctrl)
 	m.EXPECT().GetCluster(gomock.Any(), id.String()).Return(stored, nil)
 	m.EXPECT().PutCluster(gomock.Any(), gomock.Any()).DoAndReturn(func(_ interface{}, got *cluster.Cluster) error {
-		if got.AuthToken != stored.AuthToken {
-			t.Fatalf("auth token was not preserved")
+		if got.AuthToken != "" || len(got.KnownHosts) != 0 {
+			t.Fatalf("REST injected stale internal fields: %#v", got)
 		}
 		return nil
 	})
@@ -232,7 +249,7 @@ func TestClusterDeleteCQLCredentials(t *testing.T) {
 	m := restapi.NewMockClusterService(ctrl)
 	gomock.InOrder(
 		m.EXPECT().GetCluster(gomock.Any(), id.String()).Return(&cluster.Cluster{ID: id}, nil),
-		m.EXPECT().DeleteCQLCredentials(gomock.Any(), id).Return(nil),
+		m.EXPECT().DeleteConnectionSecrets(gomock.Any(), id, cluster.SecretDeletion{CQLCredentials: true}).Return(nil),
 	)
 
 	h := restapi.New(restapi.Services{Cluster: m}, log.Logger{})
@@ -259,7 +276,7 @@ func TestClusterDeleteAlternatorCredentials(t *testing.T) {
 	m := restapi.NewMockClusterService(ctrl)
 	gomock.InOrder(
 		m.EXPECT().GetCluster(gomock.Any(), id.String()).Return(&cluster.Cluster{ID: id}, nil),
-		m.EXPECT().DeleteAlternatorCredentials(gomock.Any(), id).Return(nil),
+		m.EXPECT().DeleteConnectionSecrets(gomock.Any(), id, cluster.SecretDeletion{AlternatorCredentials: true}).Return(nil),
 	)
 
 	h := restapi.New(restapi.Services{Cluster: m}, log.Logger{})
@@ -272,6 +289,34 @@ func TestClusterDeleteAlternatorCredentials(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("Expected to receive %d status code, got %d", http.StatusCreated, w.Code)
+	}
+}
+
+func TestClusterDeleteMultipleSecretsUsesOneAtomicMutation(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	id := uuid.MustRandom()
+	m := restapi.NewMockClusterService(ctrl)
+	gomock.InOrder(
+		m.EXPECT().GetCluster(gomock.Any(), id.String()).Return(&cluster.Cluster{ID: id}, nil),
+		m.EXPECT().DeleteConnectionSecrets(gomock.Any(), id, cluster.SecretDeletion{
+			CQLCredentials:        true,
+			AlternatorCredentials: true,
+			SSLUserCert:           true,
+			CQLTrust:              true,
+			AlternatorTrust:       true,
+		}).Return(nil),
+	)
+
+	h := restapi.New(restapi.Services{Cluster: m}, log.Logger{})
+	r := httptest.NewRequest(http.MethodDelete, fmt.Sprintf(
+		"/api/v1/cluster/%s?cql_creds=true&alternator_creds=true&ssl_user_cert=true&cql_ca=true&alternator_ca=true", id), nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("atomic multi-selector delete failed: %d %s", w.Code, w.Body.String())
 	}
 }
 
@@ -366,7 +411,7 @@ func TestClusterDeleteSSLUserCert(t *testing.T) {
 	m := restapi.NewMockClusterService(ctrl)
 	gomock.InOrder(
 		m.EXPECT().GetCluster(gomock.Any(), id.String()).Return(&cluster.Cluster{ID: id}, nil),
-		m.EXPECT().DeleteSSLUserCert(gomock.Any(), id).Return(nil),
+		m.EXPECT().DeleteConnectionSecrets(gomock.Any(), id, cluster.SecretDeletion{SSLUserCert: true}).Return(nil),
 	)
 
 	h := restapi.New(restapi.Services{Cluster: m}, log.Logger{})

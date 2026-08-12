@@ -3,6 +3,7 @@
 package restapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -14,7 +15,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
 	"github.com/pkg/errors"
-	"github.com/scylladb/scylla-manager/v3/pkg/secrets"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 )
 
@@ -48,6 +48,8 @@ func (h clusterFilter) clusterCtx(next http.Handler) http.Handler {
 		ctx := r.Context()
 		ctx = context.WithValue(ctx, ctxClusterID, c.ID)
 		ctx = context.WithValue(ctx, ctxCluster, c)
+		ctx = cluster.WithExpectedLifecycleEpoch(ctx, c.LifecycleEpoch)
+		ctx = cluster.WithExpectedConnectionGeneration(ctx, c.ConnectionGeneration)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -101,7 +103,15 @@ func (h clusterHandler) parseCluster(r *http.Request) (*cluster.Cluster, map[str
 		return nil, nil, err
 	}
 	var c cluster.Cluster
-	if err := json.Unmarshal(b, &c); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&c); err != nil {
+		return nil, nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values are not allowed")
+		}
 		return nil, nil, err
 	}
 	var fields map[string]json.RawMessage
@@ -143,18 +153,17 @@ func (h clusterHandler) loadCluster(w http.ResponseWriter, r *http.Request) {
 func (h clusterHandler) updateCluster(w http.ResponseWriter, r *http.Request) {
 	c := mustClusterFromCtx(r)
 
-	newCluster, fields, err := h.parseCluster(r)
+	newCluster, _, err := h.parseCluster(r)
 	if err != nil {
 		respondBadRequest(w, r, err)
 		return
 	}
 	newCluster.ID = c.ID
-	// Cluster.KnownHosts are not part of REST API definitions,
-	// so we need to fill them based on current cluster state.
-	newCluster.KnownHosts = c.KnownHosts
-	if _, present := fields["auth_token"]; !present {
-		newCluster.AuthToken = c.AuthToken
-	}
+	newCluster.SetExpectedLifecycleEpoch(c.LifecycleEpoch)
+	// Do not copy internal or write-only values from the middleware snapshot.
+	// Another Manager replica may rotate A to B after clusterCtx. The service
+	// refetches the authoritative active generation under its mutation boundary
+	// and preserves omitted values from B, never from this potentially stale A.
 
 	if err := h.svc.PutCluster(r.Context(), newCluster); err != nil {
 		respondError(w, r, errors.Wrapf(err, "update cluster %q", c.ID))
@@ -171,6 +180,12 @@ func (h clusterHandler) updateCluster(w http.ResponseWriter, r *http.Request) {
 func (h clusterHandler) sanitizedCluster(c *cluster.Cluster) (*cluster.Cluster, error) {
 	out := *c
 	out.AuthTokenSet = c.AuthToken != ""
+	out.CQLCredentialsSet = c.Username != "" && c.Password != ""
+	out.AlternatorCredentialsSet = c.AlternatorAccessKeyID != "" && c.AlternatorSecretAccessKey != ""
+	out.SSLUserCertSet = len(c.SSLUserCertFile) != 0 && len(c.SSLUserKeyFile) != 0
+	out.CQLCASet = len(c.CQLCAFile) != 0 && c.CQLServerName != ""
+	out.AlternatorCASet = len(c.AlternatorCAFile) != 0 && c.AlternatorServerName != ""
+	out.AgentCASet = len(c.AgentCAFile) != 0 && c.AgentServerName != ""
 	out.AuthToken = ""
 	out.Username = ""
 	out.Password = ""
@@ -185,25 +200,6 @@ func (h clusterHandler) sanitizedCluster(c *cluster.Cluster) (*cluster.Cluster, 
 	out.AgentCAFile = nil
 	out.AgentServerName = ""
 
-	checks := []struct {
-		name string
-		set  *bool
-		fn   func() (bool, error)
-	}{
-		{"CQL credentials", &out.CQLCredentialsSet, func() (bool, error) { return h.svc.CheckCQLCredentials(c.ID) }},
-		{"Alternator credentials", &out.AlternatorCredentialsSet, func() (bool, error) { return h.svc.CheckAlternatorCredentials(c.ID) }},
-		{"SSL user certificate", &out.SSLUserCertSet, func() (bool, error) { return h.svc.CheckSSLUserCert(c.ID) }},
-		{"CQL CA", &out.CQLCASet, func() (bool, error) { return h.svc.CheckTLSTrust(c.ID, secrets.CQLProtocol) }},
-		{"Alternator CA", &out.AlternatorCASet, func() (bool, error) { return h.svc.CheckTLSTrust(c.ID, secrets.AlternatorProtocol) }},
-		{"Agent CA", &out.AgentCASet, func() (bool, error) { return h.svc.CheckTLSTrust(c.ID, secrets.AgentProtocol) }},
-	}
-	for _, check := range checks {
-		set, err := check.fn()
-		if err != nil {
-			return nil, errors.Wrap(err, "check "+check.name)
-		}
-		*check.set = set
-	}
 	return &out, nil
 }
 
@@ -284,33 +280,17 @@ func (h clusterHandler) deleteCluster(w http.ResponseWriter, r *http.Request) {
 		respondBadRequest(w, r, errors.New("at least one cluster secret selector must be true"))
 		return
 	}
-	if deleteCQLCredentials {
-		if err := h.svc.DeleteCQLCredentials(r.Context(), c.ID); err != nil {
-			respondError(w, r, errors.Wrapf(err, "delete CQL credentials for cluster %q", c.ID))
-			return
+	if deleteAny {
+		deletion := cluster.SecretDeletion{
+			CQLCredentials:        deleteCQLCredentials,
+			AlternatorCredentials: deleteAlternatorCredentials,
+			SSLUserCert:           deleteSSLUserCert,
+			CQLTrust:              deleteCQLCA,
+			AlternatorTrust:       deleteAlternatorCA,
 		}
-	}
-	if deleteAlternatorCredentials {
-		if err := h.svc.DeleteAlternatorCredentials(r.Context(), c.ID); err != nil {
-			respondError(w, r, errors.Wrapf(err, "delete alternator credentials for cluster %q", c.ID))
+		if err := h.svc.DeleteConnectionSecrets(r.Context(), c.ID, deletion); err != nil {
+			respondError(w, r, errors.Wrapf(err, "delete connection secrets for cluster %q", c.ID))
 			return
-		}
-	}
-	if deleteSSLUserCert {
-		if err := h.svc.DeleteSSLUserCert(r.Context(), c.ID); err != nil {
-			respondError(w, r, errors.Wrapf(err, "delete SSL user cert for cluster %q", c.ID))
-			return
-		}
-	}
-	for protocol, remove := range map[string]bool{
-		secrets.CQLProtocol:        deleteCQLCA,
-		secrets.AlternatorProtocol: deleteAlternatorCA,
-	} {
-		if remove {
-			if err := h.svc.DeleteTLSTrust(r.Context(), c.ID, protocol); err != nil {
-				respondError(w, r, errors.Wrapf(err, "delete %s TLS trust for cluster %q", protocol, c.ID))
-				return
-			}
 		}
 	}
 }

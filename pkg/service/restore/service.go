@@ -80,6 +80,7 @@ func (s *Service) Restore(ctx context.Context, clusterID, taskID, runID uuid.UUI
 	if err != nil {
 		return errors.Wrap(err, "create worker")
 	}
+	ctx = w.connectionContext(ctx)
 	defer w.clusterSession.Close()
 	w.setRunInfo(taskID, runID)
 
@@ -136,6 +137,7 @@ func (s *Service) GetTargetUnitsViews(ctx context.Context, clusterID uuid.UUID, 
 	if err != nil {
 		return Target{}, nil, nil, errors.Wrap(err, "create worker")
 	}
+	ctx = w.connectionContext(ctx)
 	defer w.clusterSession.Close()
 
 	if err := w.init(ctx, properties); err != nil {
@@ -185,6 +187,8 @@ func (s *Service) newWorker(ctx context.Context, clusterID uuid.UUID) (worker, e
 	if err != nil {
 		return worker{}, errors.Wrap(err, "get client")
 	}
+	generation := client.Config().ConnectionGeneration
+	ctx = cluster.WithExpectedConnectionGeneration(ctx, generation)
 	clusterSession, err := s.clusterSession(ctx, clusterID)
 	if err != nil {
 		return worker{}, errors.Wrap(err, "get CQL cluster session")
@@ -195,6 +199,9 @@ func (s *Service) newWorker(ctx context.Context, clusterID uuid.UUID) (worker, e
 	rawNodeConfig, err := s.configCache.ReadAll(clusterID)
 	if err != nil {
 		return worker{}, errors.Wrap(err, "read all nodes config")
+	}
+	if err := configcache.ValidateExpectedConnectionGeneration(ctx, rawNodeConfig); err != nil {
+		return worker{}, errors.Wrap(err, "read one connection generation")
 	}
 	nodeConfig, err := maps.MapKeyWithError(rawNodeConfig, netip.ParseAddr)
 	if err != nil {
@@ -215,14 +222,15 @@ func (s *Service) newWorker(ctx context.Context, clusterID uuid.UUID) (worker, e
 			ClusterID: clusterID,
 			Stage:     StageInit,
 		},
-		config:           s.config,
-		logger:           s.logger,
-		metrics:          s.metrics,
-		client:           client,
-		session:          s.session,
-		clusterSession:   clusterSession,
-		alternatorClient: alternatorClient,
-		nodeConfig:       nodeConfig,
+		config:               s.config,
+		logger:               s.logger,
+		metrics:              s.metrics,
+		client:               client,
+		session:              s.session,
+		clusterSession:       clusterSession,
+		alternatorClient:     alternatorClient,
+		nodeConfig:           nodeConfig,
+		connectionGeneration: generation,
 	}, nil
 }
 

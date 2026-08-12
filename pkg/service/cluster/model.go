@@ -3,6 +3,7 @@
 package cluster
 
 import (
+	"context"
 	"crypto/tls"
 
 	"github.com/pkg/errors"
@@ -14,13 +15,19 @@ import (
 
 // Cluster specifies a cluster properties.
 type Cluster struct {
-	ID         uuid.UUID         `json:"id"`
-	Name       string            `json:"name"`
-	Labels     map[string]string `json:"labels"`
-	Host       string            `json:"host"` // The initial contact point for SM (DNS or IP)
-	KnownHosts []string          `json:"-"`    // Hosts discovered by connecting to Host (IPs)
-	Port       int               `json:"port,omitempty"`
-	AuthToken  string            `json:"auth_token,omitempty"`
+	ID uuid.UUID `json:"id"`
+	// ConnectionGeneration binds this row to one complete ConnectionBundle.
+	// It is never part of the public API.
+	ConnectionGeneration         uuid.UUID         `json:"-"`
+	ConnectionDeleted            bool              `json:"-"`
+	LifecycleEpoch               int64             `json:"-"`
+	PreviousConnectionGeneration uuid.UUID         `json:"-" db:"-"`
+	Name                         string            `json:"name"`
+	Labels                       map[string]string `json:"labels"`
+	Host                         string            `json:"host"` // The initial contact point for SM (DNS or IP)
+	KnownHosts                   []string          `json:"-"`    // Hosts discovered by connecting to Host (IPs)
+	Port                         int               `json:"port,omitempty"`
+	AuthToken                    string            `json:"auth_token,omitempty" db:"-"`
 
 	ForceTLSDisabled       bool `json:"force_tls_disabled"`
 	ForceNonSSLSessionPort bool `json:"force_non_ssl_session_port"`
@@ -37,15 +44,67 @@ type Cluster struct {
 	AlternatorServerName      string `json:"alternator_server_name,omitempty" db:"-"`
 	AgentCAFile               []byte `json:"agent_ca_file,omitempty" db:"-"`
 	AgentServerName           string `json:"agent_server_name,omitempty" db:"-"`
+	AuthTokenSet              bool   `json:"auth_token_set,omitempty" db:"-"`
+	CQLCredentialsSet         bool   `json:"cql_credentials_set,omitempty" db:"-"`
+	AlternatorCredentialsSet  bool   `json:"alternator_credentials_set,omitempty" db:"-"`
+	SSLUserCertSet            bool   `json:"ssl_user_cert_set,omitempty" db:"-"`
+	CQLCASet                  bool   `json:"cql_ca_set,omitempty" db:"-"`
+	AlternatorCASet           bool   `json:"alternator_ca_set,omitempty" db:"-"`
+	AgentCASet                bool   `json:"agent_ca_set,omitempty" db:"-"`
+	WithoutRepair             bool   `json:"without_repair,omitempty" db:"-"`
 
-	AuthTokenSet             bool `json:"auth_token_set,omitempty" db:"-"`
-	CQLCredentialsSet        bool `json:"cql_credentials_set,omitempty" db:"-"`
-	AlternatorCredentialsSet bool `json:"alternator_credentials_set,omitempty" db:"-"`
-	SSLUserCertSet           bool `json:"ssl_user_cert_set,omitempty" db:"-"`
-	CQLCASet                 bool `json:"cql_ca_set,omitempty" db:"-"`
-	AlternatorCASet          bool `json:"alternator_ca_set,omitempty" db:"-"`
-	AgentCASet               bool `json:"agent_ca_set,omitempty" db:"-"`
-	WithoutRepair            bool `json:"without_repair,omitempty" db:"-"`
+	deleteCQLCredentials        bool
+	deleteAlternatorCredentials bool
+	deleteSSLUserCert           bool
+	deleteCQLTrust              bool
+	deleteAlternatorTrust       bool
+	expectedLifecycleEpoch      *int64
+}
+
+// SecretDeletion selects write-only connection values to clear in one atomic
+// generation mutation.
+type SecretDeletion struct {
+	CQLCredentials         bool
+	AlternatorCredentials  bool
+	SSLUserCert            bool
+	CQLTrust               bool
+	AlternatorTrust        bool
+	ExpectedLifecycleEpoch *int64
+}
+
+type expectedLifecycleEpochContextKey struct{}
+
+// WithExpectedLifecycleEpoch binds a mutation to the lifecycle observed by
+// request admission. It prevents a paused request for lifecycle N from
+// mutating a cluster ID that was deleted and recreated at lifecycle N+1.
+func WithExpectedLifecycleEpoch(ctx context.Context, epoch int64) context.Context {
+	return context.WithValue(ctx, expectedLifecycleEpochContextKey{}, epoch)
+}
+
+// ExpectedLifecycleEpoch returns the request-admission lifecycle precondition.
+func ExpectedLifecycleEpoch(ctx context.Context) (int64, bool) {
+	epoch, ok := ctx.Value(expectedLifecycleEpochContextKey{}).(int64)
+	return epoch, ok
+}
+
+func (c *Cluster) requireExpectedLifecycleEpoch(ctx context.Context, active int64) error {
+	expected := c.expectedLifecycleEpoch
+	if expected == nil {
+		if epoch, ok := ExpectedLifecycleEpoch(ctx); ok {
+			expected = &epoch
+		}
+	}
+	if expected != nil && *expected != active {
+		return errors.Wrapf(ErrConnectionCommitConflict, "expected lifecycle epoch %d, active lifecycle epoch %d", *expected, active)
+	}
+	return nil
+}
+
+// SetExpectedLifecycleEpoch makes an API mutation conditional on the cluster
+// lifecycle observed before request handling. Normal A->B rotations retain
+// the epoch; a stale request admitted before deletion is rejected.
+func (c *Cluster) SetExpectedLifecycleEpoch(epoch int64) {
+	c.expectedLifecycleEpoch = &epoch
 }
 
 // String returns cluster Name or ID if Name is empty.

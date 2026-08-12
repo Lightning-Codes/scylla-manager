@@ -13,7 +13,6 @@ import (
 	"github.com/scylladb/go-log"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
-	"github.com/scylladb/scylla-manager/v3/pkg/store"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/uuid"
 )
 
@@ -52,9 +51,7 @@ type Service struct {
 
 	clusterSvc   cluster.Servicer
 	scyllaClient scyllaclient.ProviderFunc
-	secretsStore store.Store
-
-	configs *sync.Map
+	configs      *sync.Map
 	// revisions contains a monotonically increasing generation per cluster. It
 	// prevents a slower refresh that started with old trust from publishing
 	// after a newer rotation or deletion refresh.
@@ -67,17 +64,18 @@ type Service struct {
 }
 
 type clusterConfigEntry struct {
-	revision uint64
-	configs  *sync.Map
+	revision             uint64
+	connectionGeneration uuid.UUID
+	lifecycleEpoch       int64
+	configs              *sync.Map
 }
 
 // NewService is the constructor for the cluster config cache service.
-func NewService(config Config, clusterSvc cluster.Servicer, client scyllaclient.ProviderFunc, secretsStore store.Store, logger log.Logger) ConfigCacher {
+func NewService(config Config, clusterSvc cluster.Servicer, client scyllaclient.ProviderFunc, logger log.Logger) ConfigCacher {
 	return &Service{
 		svcConfig:    config,
 		clusterSvc:   clusterSvc,
 		scyllaClient: client,
-		secretsStore: secretsStore,
 		configs:      &sync.Map{},
 		revisions:    &sync.Map{},
 		logger:       logger,
@@ -177,13 +175,30 @@ func (svc *Service) RemoveCluster(clusterID uuid.UUID) {
 // Hosts argument allows for restricting the update to specific hosts. Empty hosts results in full update.
 func (svc *Service) ForceUpdateCluster(ctx context.Context, clusterID uuid.UUID, hosts ...string) bool {
 	logger := svc.logger.Named("Force update cluster").With("cluster", clusterID)
-	revision := svc.beginRefresh(clusterID)
-
+	// Reserve ordering before the authoritative read. A refresh that captures A
+	// and pauses cannot later take a revision newer than a B refresh and evict B.
+	revision := svc.nextRevision(clusterID)
 	c, err := svc.clusterSvc.GetCluster(ctx, clusterID.String())
 	if err != nil {
+		if errors.Is(err, cluster.ErrConnectionCommitConflict) {
+			// A workflow pinned to stale A must not evict an already-published B.
+			logger.Error(ctx, "Update rejected by generation precondition", "error", err)
+			return false
+		}
+		// Not-found may be a remote lifecycle tombstone, and any other failure
+		// cannot authorize continued use of cached credentials.
+		svc.invalidateOlderConfig(clusterID, revision)
 		logger.Error(ctx, "Update failed", "error", err)
 		return false
 	}
+	if expected, ok := cluster.ExpectedConnectionGeneration(ctx); ok && c.ConnectionGeneration != expected {
+		// A workflow pinned to stale A must not evict an already-published B
+		// cache. It fails before touching the current generation instead.
+		logger.Error(ctx, "Update failed", "error", errors.Wrapf(cluster.ErrConnectionCommitConflict,
+			"expected generation %s, active generation %s", expected, c.ConnectionGeneration))
+		return false
+	}
+	svc.invalidateOlderConfig(clusterID, revision)
 
 	return svc.updateSingle(ctx, c, revision, hosts...)
 }
@@ -191,22 +206,55 @@ func (svc *Service) ForceUpdateCluster(ctx context.Context, clusterID uuid.UUID,
 // AvailableHosts returns list of hosts of given cluster that keep their configuration in cache.
 func (svc *Service) AvailableHosts(ctx context.Context, clusterID uuid.UUID) ([]string, error) {
 	logger := svc.logger.Named("Listing available hosts").With("cluster", clusterID)
-
-	clusterConfig, err := svc.readClusterConfig(clusterID)
+	current, err := svc.clusterSvc.GetCluster(ctx, clusterID.String())
 	if err != nil {
+		// Do not mutate a possibly newer cache based on a stale not-found window
+		// across D->C. This acquisition itself fails closed before returning hosts;
+		// updateAll performs authoritative absence reconciliation.
 		return nil, err
 	}
 
+	rawEntry, ok := svc.configs.Load(clusterID.String())
+	if !ok {
+		return nil, ErrNoClusterConfig
+	}
+	entry, ok := rawEntry.(*clusterConfigEntry)
+	if !ok {
+		panic("cluster config cache stores unexpected type")
+	}
+	clusterConfig := entry.configs
+
 	var availableHosts []string
-	clusterConfig.Range(func(key, _ any) bool {
+	var generationErr error
+	clusterConfig.Range(func(key, value any) bool {
 		host, ok := key.(string)
 		if !ok {
 			logger.Error(ctx, "Cannot cast to string", "host", key, "error", err)
 			return false
 		}
+		cfg, ok := value.(NodeConfig)
+		if !ok {
+			panic("cluster host config cache stores unexpected type")
+		}
+		if cfg.ConnectionGeneration != current.ConnectionGeneration || cfg.ConnectionLifecycleEpoch != current.LifecycleEpoch {
+			generationErr = errors.Wrapf(cluster.ErrConnectionCommitConflict,
+				"cached generation %s at epoch %d, active generation %s at epoch %d",
+				cfg.ConnectionGeneration, cfg.ConnectionLifecycleEpoch, current.ConnectionGeneration, current.LifecycleEpoch)
+			return false
+		}
 		availableHosts = append(availableHosts, host)
 		return true
 	})
+	if generationErr != nil {
+		// current may be A while a concurrent refresh has already published B.
+		// Unconditionally removing here would evict the newer verified snapshot.
+		// Fail this caller closed; the authoritative refresh path reconciles the
+		// remaining active generation.
+		// Do not delete here: current may be A while rawEntry is a concurrently
+		// published B. The authoritative refresh/reconciliation path owns cache
+		// removal and revalidates the pointer around publication.
+		return nil, generationErr
+	}
 
 	return availableHosts, nil
 }
@@ -214,8 +262,30 @@ func (svc *Service) AvailableHosts(ctx context.Context, clusterID uuid.UUID) ([]
 func (svc *Service) updateSingle(ctx context.Context, c *cluster.Cluster, revision uint64, hosts ...string) bool {
 	logger := svc.logger.Named("Cluster config update").With("cluster", c.ID)
 	clusterConfig := &sync.Map{}
+	// List/updateAll snapshots are discovery hints only. Resolve the exact
+	// current pointer before creating a credential-bearing client or making any
+	// Agent/data-plane request. A remote tombstone or rotation fails before the
+	// network boundary.
+	current, err := svc.clusterSvc.GetCluster(ctx, c.ID.String())
+	if err != nil || current.ConnectionGeneration != c.ConnectionGeneration || current.LifecycleEpoch != c.LifecycleEpoch {
+		logger.Info(ctx, "Discarding stale cluster snapshot before client construction",
+			"snapshot_generation", c.ConnectionGeneration,
+			"snapshot_epoch", c.LifecycleEpoch,
+			"error", err,
+		)
+		return false
+	}
+	c = current
 
-	client, err := svc.scyllaClient(ctx, c.ID)
+	var client *scyllaclient.Client
+	err = nil
+	if provider, ok := svc.clusterSvc.(interface {
+		CreateClientForClusterSnapshot(*cluster.Cluster) (*scyllaclient.Client, error)
+	}); ok {
+		client, err = provider.CreateClientForClusterSnapshot(c)
+	} else {
+		client, err = svc.scyllaClient(ctx, c.ID)
+	}
 	if err != nil {
 		logger.Error(ctx, "Couldn't create scylla client", "cluster", c.ID, "error", err)
 		return false
@@ -225,7 +295,20 @@ func (svc *Service) updateSingle(ctx context.Context, c *cluster.Cluster, revisi
 			logger.Error(ctx, "Couldn't close HTTP client", "error", err)
 		}
 	}()
-
+	if client.Config().ConnectionGeneration != c.ConnectionGeneration {
+		logger.Info(ctx, "Discarding mixed-generation Agent client",
+			"cluster_generation", c.ConnectionGeneration,
+			"client_generation", client.Config().ConnectionGeneration,
+		)
+		return false
+	}
+	if client.Config().ConnectionLifecycleEpoch != c.LifecycleEpoch {
+		logger.Info(ctx, "Discarding mixed-lifecycle Agent client",
+			"cluster_epoch", c.LifecycleEpoch,
+			"client_epoch", client.Config().ConnectionLifecycleEpoch,
+		)
+		return false
+	}
 	// In case of empty hosts, use the ones discovered by scylla client
 	if len(hosts) == 0 {
 		hosts = client.Config().Hosts
@@ -265,20 +348,20 @@ func (svc *Service) updateSingle(ctx context.Context, c *cluster.Cluster, revisi
 		// rotated TLS material happened to load successfully.
 		return false
 	}
-	if !svc.publishConfig(c.ID, revision, clusterConfig) {
+	current, err = svc.clusterSvc.GetCluster(ctx, c.ID.String())
+	if err != nil || current.ConnectionGeneration != c.ConnectionGeneration || current.LifecycleEpoch != c.LifecycleEpoch {
+		logger.Info(ctx, "Discarding configuration from a no-longer-active connection generation",
+			"loaded_generation", c.ConnectionGeneration,
+			"error", err,
+		)
+		return false
+	}
+	if !svc.publishConfig(c.ID, c.ConnectionGeneration, c.LifecycleEpoch, revision, clusterConfig) {
 		logger.Info(ctx, "Discarding stale cluster config refresh", "revision", revision)
 		return false
 	}
 
 	return true
-}
-
-func (svc *Service) beginRefresh(clusterID uuid.UUID) uint64 {
-	revision := svc.nextRevision(clusterID)
-	// Remove the previous material before reading either the cluster row or its
-	// rotated secrets. A failed refresh must never retain stale trust/identity.
-	svc.invalidateOlderConfig(clusterID, revision)
-	return revision
 }
 
 func (svc *Service) invalidateOlderConfig(clusterID uuid.UUID, revision uint64) {
@@ -301,9 +384,14 @@ func (svc *Service) invalidateOlderConfig(clusterID uuid.UUID, revision uint64) 
 	}
 }
 
-func (svc *Service) publishConfig(clusterID uuid.UUID, revision uint64, configs *sync.Map) bool {
+func (svc *Service) publishConfig(clusterID, generation uuid.UUID, lifecycleEpoch int64, revision uint64, configs *sync.Map) bool {
 	key := clusterID.String()
-	candidate := &clusterConfigEntry{revision: revision, configs: configs}
+	candidate := &clusterConfigEntry{
+		revision:             revision,
+		connectionGeneration: generation,
+		lifecycleEpoch:       lifecycleEpoch,
+		configs:              configs,
+	}
 	for svc.currentRevision(clusterID) == revision {
 		raw, loaded := svc.configs.LoadOrStore(key, candidate)
 		if !loaded {
@@ -349,8 +437,16 @@ func (svc *Service) updateAll(ctx context.Context) {
 	clusters, err := svc.clusterSvc.ListClusters(ctx, &cluster.Filter{})
 	if err != nil {
 		svc.logger.Error(ctx, "Couldn't list clusters", "error", err)
+		// An unavailable authoritative list cannot justify retaining any cached
+		// credential-bearing snapshot. Background refresh is fail closed.
+		svc.removeClustersAbsentFrom(nil)
 		return
 	}
+	active := make(map[string]struct{}, len(clusters))
+	for _, c := range clusters {
+		active[c.ID.String()] = struct{}{}
+	}
+	svc.removeClustersAbsentFrom(active)
 
 	clustersWg := sync.WaitGroup{}
 	for _, c := range clusters {
@@ -363,6 +459,26 @@ func (svc *Service) updateAll(ctx context.Context) {
 	clustersWg.Wait()
 }
 
+func (svc *Service) removeClustersAbsentFrom(active map[string]struct{}) {
+	svc.configs.Range(func(key, _ any) bool {
+		clusterKey, ok := key.(string)
+		if !ok {
+			svc.configs.Delete(key)
+			return true
+		}
+		if _, keep := active[clusterKey]; keep {
+			return true
+		}
+		id, err := uuid.Parse(clusterKey)
+		if err != nil {
+			svc.configs.Delete(key)
+			return true
+		}
+		svc.RemoveCluster(id)
+		return true
+	})
+}
+
 func (svc *Service) readClusterConfig(clusterID uuid.UUID) (*sync.Map, error) {
 	emptyConfig := &sync.Map{}
 
@@ -373,9 +489,6 @@ func (svc *Service) readClusterConfig(clusterID uuid.UUID) (*sync.Map, error) {
 	entry, ok := rawClusterConfig.(*clusterConfigEntry)
 	if !ok {
 		panic("cluster cache emptyConfig stores unexpected type")
-	}
-	if entry.revision != svc.currentRevision(clusterID) {
-		return emptyConfig, ErrNoClusterConfig
 	}
 	return entry.configs, nil
 }
@@ -398,7 +511,7 @@ func (svc *Service) retrieveNodeConfig(ctx context.Context, host string, client 
 		return config, errors.Wrap(err, "retrieve host Rack info")
 	}
 
-	config, err = NewNodeConfig(c, nodeInfoResp, svc.secretsStore, host, dc, rack)
+	config, err = NewNodeConfig(c, nodeInfoResp, host, dc, rack)
 	if err != nil {
 		return config, errors.Wrap(err, "retrieve cluster host configuration")
 	}

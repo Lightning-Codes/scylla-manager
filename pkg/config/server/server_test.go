@@ -131,6 +131,7 @@ func TestDatabaseCredentialsRequireVerifiedTLS(t *testing.T) {
 	valid.Database.SSL = true
 	valid.SSL.Validate = true
 	valid.SSL.CertFile = "/run/secrets/database/ca.crt"
+	valid.SSL.ServerName = "scylladb-client.scylla-manager.svc"
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid authenticated database TLS rejected: %v", err)
 	}
@@ -138,6 +139,7 @@ func TestDatabaseCredentialsRequireVerifiedTLS(t *testing.T) {
 		"plaintext":           func(c *server.Config) { c.Database.SSL = false },
 		"unverified TLS":      func(c *server.Config) { c.SSL.Validate = false },
 		"missing pinned CA":   func(c *server.Config) { c.SSL.CertFile = "" },
+		"missing server name": func(c *server.Config) { c.SSL.ServerName = "" },
 		"incomplete identity": func(c *server.Config) { c.SSL.UserCertFile = "client.crt" },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -191,6 +193,7 @@ func TestConfigModification(t *testing.T) {
 		SSL: server.SSLConfig{
 			CertFile:     "ca.pem",
 			Validate:     true,
+			ServerName:   "metadata.internal",
 			UserCertFile: "ssl.cert",
 			UserKeyFile:  "ssl.key",
 		},

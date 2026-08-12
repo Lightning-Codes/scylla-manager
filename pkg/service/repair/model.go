@@ -48,6 +48,8 @@ type Target struct {
 	SmallTableThreshold int64                        `json:"small_table_threshold"`
 	IncrementalMode     scyllaclient.IncrementalMode `json:"incremental_mode"`
 	AllowEmpty          bool                         `json:"allow_empty"`
+
+	connectionGeneration uuid.UUID `json:"-"`
 }
 
 // HostString is a wrapper for Target.Host.String().

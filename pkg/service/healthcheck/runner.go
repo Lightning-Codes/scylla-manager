@@ -10,6 +10,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/scylladb/go-log"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/configcache"
 	"github.com/scylladb/scylla-manager/v3/pkg/util"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/slice"
@@ -78,20 +79,38 @@ func (r runner) Run(ctx context.Context, clusterID, _, _ uuid.UUID, _ json.RawMe
 	// Enable interactive mode for fast backoff
 	ctx = scyllaclient.Interactive(ctx)
 
+	if r.scyllaClient == nil {
+		return errors.New("missing Scylla client provider")
+	}
+	client, err := r.scyllaClient(ctx, clusterID)
+	if err != nil {
+		return errors.Wrap(err, "get generation-pinned client")
+	}
+	expectedGeneration := client.Config().ConnectionGeneration
+	if expectedGeneration == uuid.Nil {
+		return errors.Wrap(cluster.ErrConnectionCommitConflict, "active connection generation is nil")
+	}
+	ctx = cluster.WithExpectedConnectionGeneration(ctx, expectedGeneration)
+
 	nodes, err := r.configCache.AvailableHosts(ctx, clusterID)
 	if err != nil {
 		return err
 	}
 	r.removeMetricsForMissingHosts(clusterID, nodes)
-	r.checkHosts(ctx, clusterID, nodes)
+	r.checkHosts(ctx, clusterID, expectedGeneration, nodes)
 
 	return nil
 }
 
-func (r runner) checkHosts(ctx context.Context, clusterID uuid.UUID, addresses []string) {
+func (r runner) checkHosts(ctx context.Context, clusterID, expectedGeneration uuid.UUID, addresses []string) {
 	f := func(i int) error {
 		rtt := time.Duration(0)
 		ni, err := r.configCache.Read(clusterID, addresses[i])
+		if err == nil && ni.ConnectionGeneration != expectedGeneration {
+			err = errors.Wrapf(cluster.ErrConnectionCommitConflict,
+				"node %s uses generation %s, expected %s",
+				addresses[i], ni.ConnectionGeneration, expectedGeneration)
+		}
 		if err == nil {
 			rtt, err = r.ping(ctx, clusterID, addresses[i], r.timeout, ni)
 		}

@@ -122,6 +122,7 @@ func (s *Service) GetTarget(ctx context.Context, clusterID uuid.UUID, properties
 	if err != nil {
 		return t, errors.Wrapf(err, "get client")
 	}
+	ctx = cluster.WithExpectedConnectionGeneration(ctx, client.Config().ConnectionGeneration)
 	dcMap, err := client.Datacenters(ctx)
 	if err != nil {
 		return t, errors.Wrap(err, "read datacenters")
@@ -197,6 +198,7 @@ func (s *Service) GetTarget(ctx context.Context, clusterID uuid.UUID, properties
 
 	// Set filtered units as they are still used for displaying --dry-run
 	t.Units = p.FilteredUnits(t.Units)
+	t.connectionGeneration = client.Config().ConnectionGeneration
 	return t, nil
 }
 
@@ -287,6 +289,18 @@ func (s *Service) Repair(ctx context.Context, clusterID, taskID, runID uuid.UUID
 		"run_id", runID,
 		"target", target,
 	)
+	client, err := s.scyllaClient(ctx, clusterID)
+	if err != nil {
+		return errors.Wrap(err, "get client")
+	}
+	if target.connectionGeneration == uuid.Nil || client.Config().ConnectionGeneration == uuid.Nil ||
+		target.connectionGeneration != client.Config().ConnectionGeneration {
+		return errors.Wrapf(cluster.ErrConnectionCommitConflict,
+			"repair target generation %s, active generation %s; regenerate the complete target",
+			target.connectionGeneration, client.Config().ConnectionGeneration)
+	}
+	ctx = cluster.WithExpectedConnectionGeneration(ctx, client.Config().ConnectionGeneration)
+
 	run := &Run{
 		ClusterID: clusterID,
 		TaskID:    taskID,
@@ -299,11 +313,6 @@ func (s *Service) Repair(ctx context.Context, clusterID, taskID, runID uuid.UUID
 	}
 	if err := s.putRun(run); err != nil {
 		return errors.Wrapf(err, "put run")
-	}
-
-	client, err := s.scyllaClient(ctx, run.ClusterID)
-	if err != nil {
-		return errors.Wrap(err, "get client")
 	}
 
 	p, err := newPlan(ctx, target, client)

@@ -14,11 +14,9 @@ import (
 	"github.com/scylladb/scylla-manager/v3/pkg/config/server"
 	"github.com/scylladb/scylla-manager/v3/pkg/metrics"
 	"github.com/scylladb/scylla-manager/v3/pkg/ping/cqlping"
-	"github.com/scylladb/scylla-manager/v3/pkg/schema/table"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/configcache"
-	"github.com/scylladb/scylla-manager/v3/pkg/store"
 	. "github.com/scylladb/scylla-manager/v3/pkg/testutils"
 	. "github.com/scylladb/scylla-manager/v3/pkg/testutils/db"
 	"github.com/scylladb/scylla-manager/v3/pkg/testutils/testconfig"
@@ -184,9 +182,7 @@ func NewTestConfigCacheSvc(t *testing.T, clusterID uuid.UUID, hosts []string) co
 	t.Helper()
 
 	session := CreateScyllaManagerDBSession(t)
-	secretsStore := store.NewTableStore(session, table.Secrets)
-
-	clusterSvc, err := cluster.NewService(session, metrics.NewClusterMetrics(), secretsStore,
+	clusterSvc, err := cluster.NewService(session, metrics.NewClusterMetrics(),
 		scyllaclient.DefaultTimeoutConfig(), server.DefaultConfig().ClientCacheTimeout, log.NewDevelopment())
 	if err != nil {
 		t.Fatal(err)
@@ -203,7 +199,7 @@ func NewTestConfigCacheSvc(t *testing.T, clusterID uuid.UUID, hosts []string) co
 		return scyllaclient.NewClient(sc, log.NewDevelopment())
 	}
 
-	svc := configcache.NewService(configcache.DefaultConfig(), clusterSvc, scyllaClientProvider, secretsStore, log.NewDevelopment())
+	svc := configcache.NewService(configcache.DefaultConfig(), clusterSvc, scyllaClientProvider, log.NewDevelopment())
 	svc.Init(t.Context())
 	return svc
 }

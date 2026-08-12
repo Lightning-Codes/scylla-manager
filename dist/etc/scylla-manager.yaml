@@ -101,6 +101,9 @@ http: 127.0.0.1:5080
 #
 # Verify the hostname and server cert.
 #  validate: true
+# Explicit DNS/IP identity required for authenticated Manager metadata-store
+# connections. This remains stable even when database hosts are discovered as IPs.
+#  server_name:
 #
 # Client certificate and key in PEM format. It has to be provided when
 # client_encryption_options.require_client_auth=true is set on server.

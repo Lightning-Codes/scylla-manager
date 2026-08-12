@@ -17,6 +17,8 @@ import (
 	"github.com/scylladb/scylla-manager/backupspec"
 	"github.com/scylladb/scylla-manager/v3/pkg/schema/table"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/configcache"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/scheduler"
 	"github.com/scylladb/scylla-manager/v3/pkg/util"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/jsonutil"
@@ -34,7 +36,8 @@ type ValidationTarget struct {
 	DeleteOrphanedFiles bool                  `json:"delete_orphaned_files"`
 	Parallel            int                   `json:"parallel"`
 
-	liveNodes scyllaclient.NodeStatusInfoSlice
+	liveNodes            scyllaclient.NodeStatusInfoSlice
+	connectionGeneration uuid.UUID
 }
 
 // ValidationRunner implements scheduler.Runner.
@@ -104,6 +107,7 @@ func (s *Service) GetValidationTarget(ctx context.Context, clusterID uuid.UUID, 
 		return t, err
 	}
 	t.liveNodes = liveNodes
+	t.connectionGeneration = client.Config().ConnectionGeneration
 
 	return t, nil
 }
@@ -142,6 +146,13 @@ func (s *Service) Validate(ctx context.Context, clusterID, taskID, runID uuid.UU
 	if err != nil {
 		return errors.Wrap(err, "get client proxy")
 	}
+	if target.connectionGeneration == uuid.Nil || client.Config().ConnectionGeneration == uuid.Nil ||
+		target.connectionGeneration != client.Config().ConnectionGeneration {
+		return errors.Wrapf(cluster.ErrConnectionCommitConflict,
+			"validation target generation %s, active generation %s; regenerate the complete target",
+			target.connectionGeneration, client.Config().ConnectionGeneration)
+	}
+	ctx = cluster.WithExpectedConnectionGeneration(ctx, client.Config().ConnectionGeneration)
 
 	if len(target.liveNodes) == 0 {
 		target.liveNodes, err = s.checkValidationTarget(ctx, client, target)
@@ -156,6 +167,9 @@ func (s *Service) Validate(ctx context.Context, clusterID, taskID, runID uuid.UU
 	rawNodeConfig, err := s.configCache.ReadAll(clusterID)
 	if err != nil {
 		return errors.Wrap(err, "read all nodes config")
+	}
+	if err := configcache.ValidateExpectedConnectionGeneration(ctx, rawNodeConfig); err != nil {
+		return errors.Wrap(err, "read one connection generation")
 	}
 	nodeConfig, err := maps.MapKeyWithError(rawNodeConfig, netip.ParseAddr)
 	if err != nil {

@@ -2,12 +2,18 @@ name: Secure Manager server image
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'secure-v*'
+    inputs:
+      expected_source_commit:
+        description: Full reviewed 40-character source commit to build
+        required: true
+        type: string
+      release_tag:
+        description: Immutable release tag (secure-v...)
+        required: true
+        type: string
 
 concurrency:
-  group: secure-manager-image-${{ github.ref }}
+  group: secure-manager-release
   cancel-in-progress: false
 
 permissions:
@@ -15,14 +21,60 @@ permissions:
 
 env:
   IMAGE_NAME: ghcr.io/lightning-codes/scylla-manager
+  BUILDX_VERSION: v0.34.1
+  BUILDX_LINUX_AMD64_SHA256: f1332ddb9010bd0b72628266c3a906d9a6979848033df4c8d9bd2cd113bae12b
+  BUILDKIT_IMAGE: moby/buildkit@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+  QEMU_IMAGE: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  SYFT_IMAGE: anchore/syft@sha256:5999d209a342e55e9edf70bf8930fb5b86d8f2a783fa401178372c50e21b1d36
 
 jobs:
+  source:
+    name: Verify reviewed source commit
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.verify.outputs.commit }}
+      release_tag: ${{ steps.verify.outputs.release_tag }}
+    steps:
+      - name: Check out the exact reviewed source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.expected_source_commit }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Reject any source or release-tag mismatch
+        id: verify
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ inputs.expected_source_commit }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected_source_commit must be a full lowercase Git commit" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^secure-v[0-9][0-9A-Za-z._-]*$ ]]; then
+            echo "release_tag must match secure-v..." >&2
+            exit 1
+          fi
+          actual_commit="$(git rev-parse HEAD)"
+          if [[ "$GITHUB_SHA" != "$EXPECTED_SOURCE_COMMIT" || "$actual_commit" != "$EXPECTED_SOURCE_COMMIT" ]]; then
+            echo "reviewed source mismatch: event=$GITHUB_SHA checkout=$actual_commit expected=$EXPECTED_SOURCE_COMMIT" >&2
+            exit 1
+          fi
+          test -z "$(git status --porcelain)"
+          echo "commit=$actual_commit" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
   test:
     name: Security-focused tests
+    needs: source
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
@@ -33,29 +85,115 @@ jobs:
           go test -short -mod=vendor \
             ./pkg/secrets \
             ./pkg/store \
+            ./pkg/config/server \
             ./pkg/service/cluster \
             ./pkg/service/configcache \
             ./pkg/service/healthcheck \
+            ./pkg/service/backup \
+            ./pkg/service/repair \
+            ./pkg/service/repair/tablet \
+            ./pkg/service/restore \
+            ./pkg/service/one2onerestore \
             ./pkg/restapi \
             ./pkg/ping/dynamoping \
-            ./pkg/cmd/sctool
+            ./pkg/cmd/sctool \
+            ./schema
           go test -short -race -mod=vendor ./pkg/scyllaclient \
-            -run '^TestCachedProvider(InvalidateClosesIdleTransport|InvalidateRevokesOutstandingClient|InvalidateRetainsStableCell|RevokesEveryReplacedGeneration)$'
+            -run '^TestCachedProvider(InvalidateClosesIdleTransport|InvalidateRevokesOutstandingClient|InvalidateRetainsStableCell|RevokesEveryReplacedGeneration|HigherEpochCannotReopenRetiredClusterID|DelayedLowerEpochValidationCannotResurrect|IndeterminateDeleteCanHealFromFreshOldPointerProof|RetiresGenerationBeforeFirstAcquisition|RevokeClusterWinsPausedConstruction|ResetCannotReopenRevokedID|StaleValidationCannotResurrectRevokedCluster|AuthoritativeValidationObservesRemoteRotation)$'
+          go test -short -race -mod=vendor \
+            ./pkg/service/cluster \
+            ./pkg/service/configcache \
+            ./pkg/service/healthcheck \
+            ./pkg/service/backup \
+            ./pkg/service/repair \
+            ./pkg/service/repair/tablet \
+            ./pkg/service/restore \
+            ./pkg/service/one2onerestore
+          (cd v3/swagger && go test ./...)
+          (cd v3/pkg/managerclient && go test ./...)
 
-  publish:
-    name: Build, publish, and attest Manager server
-    needs: test
+  integration:
+    name: Greenfield metadata-store integration tests
+    needs: source
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: .go-version
+          cache: true
+      - name: Start pinned Scylla metadata store
+        run: |
+          docker run --detach --name secure-manager-scylla \
+            --publish 127.0.0.1:9042:9042 \
+            scylladb/scylla:2026.1.10@sha256:f4a7955ab91825e64cca7c15aaa2d659bb9188147c7f3393048b3e31dfcdd789 \
+            --smp 1 --memory 750M --overprovisioned 1 --developer-mode 1 \
+            --enable-user-defined-functions true --experimental-features udf
+      - name: Wait for Scylla CQL
+        run: |
+          for attempt in $(seq 1 60); do
+            if docker exec secure-manager-scylla cqlsh -e 'SELECT release_version FROM system.local' >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker logs secure-manager-scylla
+          exit 1
+      - name: Run greenfield store guard tests
+        run: |
+          go test -count=1 -race -tags integration -mod=vendor ./pkg/cmd/scylla-manager \
+            -run '^(TestPrepareGreenfieldStoreSession(TrulyEmptyBootstrap|RejectsReusedKeyspace|RejectsSchemaObjectOnlyKeyspace|MarkerTableOnlyCrashState|CrashRestartFromMigratingMarker|FinalizedSecureRestart|ConcurrentPrepare)|TestFinalizeGreenfieldStoreSessionRejectsInvalidPhase|TestInitializeManagerDatabase(RecoversDDLBeforeProgressCrash|RecoversResetCrashStates|NeverResetsReadyStore))$' \
+            -cluster=127.0.0.1 -gocql.timeout=30s
+      - name: Run idempotent v3.9.1 schema replay tests
+        run: |
+          go test -count=1 -race -tags integration -mod=vendor ./schema \
+            -run '^TestV391DDL(CanResumeAfterPartialApplicationAndRetry|IsSafeUnderConcurrentReplay)$' \
+            -cluster=127.0.0.1 -gocql.timeout=30s
+      - name: Run atomic generation and permanent-retirement tests
+        run: |
+          go test -count=1 -race -tags integration -mod=vendor ./pkg/service/cluster \
+            -run '^(TestConnectionGenerationLWTTwoWritersIntegration|TestSecureConnectionReadersObserveOnlyCompleteGenerationsIntegration|TestDeletedSecureClusterIDCannotBeRecreatedIntegration)$' \
+            -cluster=127.0.0.1 -gocql.timeout=30s
+      - name: Collect Scylla logs
+        if: always()
+        run: docker logs secure-manager-scylla
+      - name: Remove Scylla metadata store
+        if: always()
+        run: docker rm --force secure-manager-scylla
+
+  candidate:
+    name: Build and verify digest-only Manager candidate
+    needs: [source, test, integration]
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.verify_image.outputs.digest }}
+      amd64_digest: ${{ steps.verify_image.outputs.amd64_digest }}
+      arm64_digest: ${{ steps.verify_image.outputs.arm64_digest }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SOURCE_COMMIT: ${{ needs.source.outputs.commit }}
+      RELEASE_TAG: ${{ needs.source.outputs.release_tag }}
+      DOCKER_BUILD_RECORD_UPLOAD: false
+    steps:
+      - name: Check out the exact reviewed source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.source.outputs.commit }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Reverify source before registry side effects
+        run: |
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain)"
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
@@ -65,54 +203,256 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         with:
+          image: ${{ env.QEMU_IMAGE }}
           platforms: arm64
+      - name: Install checksum-pinned Buildx
+        run: |
+          set -euo pipefail
+          buildx_binary="$RUNNER_TEMP/docker-buildx"
+          curl --fail --location --silent --show-error \
+            "https://github.com/docker/buildx/releases/download/$BUILDX_VERSION/buildx-$BUILDX_VERSION.linux-amd64" \
+            --output "$buildx_binary"
+          printf '%s  %s\n' "$BUILDX_LINUX_AMD64_SHA256" "$buildx_binary" | sha256sum --check --strict
+          sudo mkdir -p /usr/local/lib/docker/cli-plugins
+          sudo install -m 0755 "$buildx_binary" /usr/local/lib/docker/cli-plugins/docker-buildx
+          docker buildx version | grep -F "github.com/docker/buildx $BUILDX_VERSION"
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - name: Compute image metadata
-        id: metadata
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=tag
-            type=sha,format=long
-          labels: |
-            org.opencontainers.image.title=Scylla Manager server
-            org.opencontainers.image.description=Strict-TLS Scylla Manager server (Agent image is intentionally not published)
-      - name: Build and push linux/amd64 and linux/arm64 image
+          cache-binary: false
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - name: Build and push linux/amd64 and linux/arm64 by digest only
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: dist/docker/scylla-manager-secure.dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
-          build-args: VERSION=${{ github.ref_name }}
+          pull: true
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=Scylla Manager server
+            org.opencontainers.image.description=Strict-TLS Scylla Manager server (Agent image is intentionally not published)
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.SOURCE_COMMIT }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+          build-args: VERSION=${{ env.RELEASE_TAG }}
           provenance: false
-          sbom: true
+          sbom: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Generate SPDX JSON SBOM for the immutable image
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      - name: Verify candidate index, child manifests, and final digest
+        id: verify_image
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Build returned an invalid digest: $BUILD_DIGEST" >&2
+            exit 1
+          fi
+
+          verify_raw_digest() {
+            local ref="$1" expected="$2" output="$3" actual
+            docker buildx imagetools inspect --raw "$ref" > "$output"
+            actual="sha256:$(sha256sum "$output" | cut -d ' ' -f 1)"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "Manifest digest mismatch for $ref: expected $expected, got $actual" >&2
+              exit 1
+            fi
+          }
+
+          index_json="$RUNNER_TEMP/manager-index-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          verify_raw_digest "$IMAGE_NAME@$BUILD_DIGEST" "$BUILD_DIGEST" "$index_json"
+          case "$(jq -r '.mediaType' "$index_json")" in
+            application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json) ;;
+            *) echo "Candidate is not an OCI/Docker image index" >&2; exit 1 ;;
+          esac
+          if [[ "$(jq '.manifests | length' "$index_json")" -ne 2 ]]; then
+            echo "Candidate index must contain exactly two platform manifests" >&2
+            jq '.manifests' "$index_json" >&2
+            exit 1
+          fi
+
+          amd64_digest="$(jq -er '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' "$index_json")"
+          arm64_digest="$(jq -er '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' "$index_json")"
+          if [[ "$amd64_digest" == "$arm64_digest" ]]; then
+            echo "amd64 and arm64 unexpectedly resolve to the same child manifest" >&2
+            exit 1
+          fi
+          for entry in "amd64:$amd64_digest" "arm64:$arm64_digest"; do
+            arch="${entry%%:*}"
+            child_digest="${entry#*:}"
+            child_json="$RUNNER_TEMP/manager-${arch}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+            verify_raw_digest "$IMAGE_NAME@$child_digest" "$child_digest" "$child_json"
+            case "$(jq -r '.mediaType' "$child_json")" in
+              application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json) ;;
+              *) echo "$arch child is not an OCI/Docker image manifest" >&2; exit 1 ;;
+            esac
+            config_json="$RUNNER_TEMP/manager-${arch}-config-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+            docker buildx imagetools inspect --format '{{json .Image}}' "$IMAGE_NAME@$child_digest" > "$config_json"
+            if [[ "$(jq -r '.os' "$config_json")" != "linux" || "$(jq -r '.architecture' "$config_json")" != "$arch" ]]; then
+              echo "$arch child config does not identify linux/$arch" >&2
+              jq '{os, architecture}' "$config_json" >&2
+              exit 1
+            fi
+          done
+          echo "digest=$BUILD_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "amd64_digest=$amd64_digest" >> "$GITHUB_OUTPUT"
+          echo "arm64_digest=$arm64_digest" >> "$GITHUB_OUTPUT"
+      - name: Generate per-platform SPDX JSON SBOMs with digest-pinned Syft
+        env:
+          AMD64_DIGEST: ${{ steps.verify_image.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.verify_image.outputs.arm64_digest }}
+        run: |
+          set -euo pipefail
+          for entry in "amd64:$AMD64_DIGEST" "arm64:$ARM64_DIGEST"; do
+            arch="${entry%%:*}"
+            digest="${entry#*:}"
+            output="scylla-manager-${arch}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.spdx.json"
+            docker run --rm \
+              --volume "$PWD:/work" \
+              --volume "$HOME/.docker/config.json:/root/.docker/config.json:ro" \
+              "$SYFT_IMAGE" \
+              "$IMAGE_NAME@$digest" \
+              --output "spdx-json=/work/$output"
+            jq -e '.spdxVersion | startswith("SPDX-")' "$output" >/dev/null
+          done
+      - name: Upload attempt-unique per-platform SBOM artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          image: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
-          format: spdx-json
-          output-file: scylla-manager.spdx.json
-          artifact-name: scylla-manager-${{ github.sha }}.spdx.json
-          upload-artifact: true
-          upload-release-assets: false
-      - name: Attest SPDX SBOM with GitHub OIDC
+          name: scylla-manager-${{ env.SOURCE_COMMIT }}-${{ github.run_id }}-${{ github.run_attempt }}-sboms
+          path: scylla-manager-*-${{ github.run_id }}-${{ github.run_attempt }}.spdx.json
+          if-no-files-found: error
+          overwrite: false
+
+  release:
+    name: Public-package gate, tag, and attest Manager server
+    needs: [source, candidate]
+    runs-on: ubuntu-latest
+    environment: secure-image-release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      SOURCE_COMMIT: ${{ needs.source.outputs.commit }}
+      RELEASE_TAG: ${{ needs.source.outputs.release_tag }}
+      VERIFIED_DIGEST: ${{ needs.candidate.outputs.digest }}
+      AMD64_DIGEST: ${{ needs.candidate.outputs.amd64_digest }}
+      ARM64_DIGEST: ${{ needs.candidate.outputs.arm64_digest }}
+      SBOM_ARTIFACT: scylla-manager-${{ needs.source.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}-sboms
+    steps:
+      - name: Check out the exact reviewed source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Reverify source before release side effects
+        run: |
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain)"
+      - name: Install checksum-pinned Buildx
+        run: |
+          set -euo pipefail
+          buildx_binary="$RUNNER_TEMP/docker-buildx"
+          curl --fail --location --silent --show-error \
+            "https://github.com/docker/buildx/releases/download/$BUILDX_VERSION/buildx-$BUILDX_VERSION.linux-amd64" \
+            --output "$buildx_binary"
+          printf '%s  %s\n' "$BUILDX_LINUX_AMD64_SHA256" "$buildx_binary" | sha256sum --check --strict
+          sudo mkdir -p /usr/local/lib/docker/cli-plugins
+          sudo install -m 0755 "$buildx_binary" /usr/local/lib/docker/cli-plugins/docker-buildx
+          docker buildx version | grep -F "github.com/docker/buildx $BUILDX_VERSION"
+      - name: Download exact-attempt per-platform SBOMs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ env.SBOM_ARTIFACT }}
+          path: .
+      - name: Require anonymous index and child digest access
+        run: |
+          set -euo pipefail
+          anonymous_config="$(mktemp -d)"
+          trap 'rm -rf "$anonymous_config"' EXIT
+          printf '{"auths":{}}\n' > "$anonymous_config/config.json"
+          verify_anonymous_digest() {
+            local ref="$1" expected="$2" raw actual
+            raw="$RUNNER_TEMP/anonymous-$(printf '%s' "$ref" | sha256sum | cut -d ' ' -f 1).json"
+            DOCKER_CONFIG="$anonymous_config" docker buildx imagetools inspect --raw "$ref" > "$raw"
+            actual="sha256:$(sha256sum "$raw" | cut -d ' ' -f 1)"
+            test "$actual" = "$expected"
+          }
+          verify_anonymous_digest "$IMAGE_NAME@$VERIFIED_DIGEST" "$VERIFIED_DIGEST"
+          verify_anonymous_digest "$IMAGE_NAME@$AMD64_DIGEST" "$AMD64_DIGEST"
+          verify_anonymous_digest "$IMAGE_NAME@$ARM64_DIGEST" "$ARM64_DIGEST"
+          DOCKER_CONFIG="$anonymous_config" docker pull "$IMAGE_NAME@$VERIFIED_DIGEST"
+      - name: Log in to GHCR for immutable tag and attestations
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attest amd64 SPDX SBOM with GitHub OIDC
         uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
         with:
           subject-name: ${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          sbom-path: scylla-manager.spdx.json
+          subject-digest: ${{ env.AMD64_DIGEST }}
+          sbom-path: scylla-manager-amd64-${{ github.run_id }}-${{ github.run_attempt }}.spdx.json
           push-to-registry: true
-      - name: Attest build provenance with GitHub OIDC
+      - name: Attest arm64 SPDX SBOM with GitHub OIDC
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ env.ARM64_DIGEST }}
+          sbom-path: scylla-manager-arm64-${{ github.run_id }}-${{ github.run_attempt }}.spdx.json
+          push-to-registry: true
+      - name: Attest index build provenance with GitHub OIDC
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ env.VERIFIED_DIGEST }}
           push-to-registry: true
+      - name: Attest amd64 build provenance with GitHub OIDC
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ env.AMD64_DIGEST }}
+          push-to-registry: true
+      - name: Attest arm64 build provenance with GitHub OIDC
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ env.ARM64_DIGEST }}
+          push-to-registry: true
+      - name: Create the final release tag only if absent
+        run: |
+          set -euo pipefail
+          release_ref="$IMAGE_NAME:$RELEASE_TAG"
+          existing="$RUNNER_TEMP/existing-release.json"
+          if docker buildx imagetools inspect --raw "$release_ref" > "$existing" 2>"$existing.err"; then
+            existing_digest="sha256:$(sha256sum "$existing" | cut -d ' ' -f 1)"
+            echo "Immutable release tag already exists at $existing_digest: $release_ref" >&2
+            exit 1
+          fi
+          if ! grep -Eqi '(^|[^0-9])(404|not found|manifest unknown)([^0-9]|$)' "$existing.err"; then
+            cat "$existing.err" >&2
+            echo "Cannot safely establish that immutable release tag is absent" >&2
+            exit 1
+          fi
+          docker buildx imagetools create --tag "$release_ref" "$IMAGE_NAME@$VERIFIED_DIGEST"
+          docker buildx imagetools inspect --raw "$release_ref" > "$RUNNER_TEMP/release-index.json"
+          release_digest="sha256:$(sha256sum "$RUNNER_TEMP/release-index.json" | cut -d ' ' -f 1)"
+          test "$release_digest" = "$VERIFIED_DIGEST"
+      - name: Require anonymous final-tag access at the verified digest
+        run: |
+          set -euo pipefail
+          anonymous_config="$(mktemp -d)"
+          trap 'rm -rf "$anonymous_config"' EXIT
+          printf '{"auths":{}}\n' > "$anonymous_config/config.json"
+          raw="$RUNNER_TEMP/anonymous-release-index.json"
+          DOCKER_CONFIG="$anonymous_config" docker buildx imagetools inspect --raw "$IMAGE_NAME:$RELEASE_TAG" > "$raw"
+          test "sha256:$(sha256sum "$raw" | cut -d ' ' -f 1)" = "$VERIFIED_DIGEST"
+          DOCKER_CONFIG="$anonymous_config" docker pull "$IMAGE_NAME:$RELEASE_TAG"

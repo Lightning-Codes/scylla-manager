@@ -10,7 +10,8 @@ import (
 
 // Target describes tables that need to be repaired.
 type Target struct {
-	KsTabs map[string][]string
+	KsTabs               map[string][]string
+	connectionGeneration uuid.UUID
 }
 
 // RunProgress is tablet repair progress representation in SM DB.

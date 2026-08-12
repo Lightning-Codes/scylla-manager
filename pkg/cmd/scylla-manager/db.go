@@ -5,6 +5,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"slices"
 	"strings"
@@ -65,6 +66,353 @@ func createKeyspace(ctx context.Context, c config.Config, logger log.Logger) err
 		}
 	}
 	return nil
+}
+
+const (
+	greenfieldBootstrapTable     = "secure_manager_bootstrap"
+	greenfieldBootstrapID        = "secure-connection-store"
+	greenfieldBootstrapContract  = "scylla-manager-v3.9.1-greenfield-v1"
+	greenfieldBootstrapMigrating = "migrating"
+	greenfieldBootstrapResetting = "resetting"
+	greenfieldBootstrapReady     = "ready"
+)
+
+type greenfieldBootstrapMarker struct {
+	Contract string
+	Phase    string
+	Claimed  bool
+}
+
+func initializeManagerDatabase(ctx context.Context, c config.Config, logger log.Logger) error {
+	ok, err := keyspaceExists(ctx, c, logger)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		logger.Info(ctx, "Creating keyspace", "keyspace", c.Database.Keyspace)
+		if err := createKeyspace(ctx, c, logger); err != nil {
+			return err
+		}
+		logger.Info(ctx, "Keyspace created", "keyspace", c.Database.Keyspace)
+	}
+
+	marker, err := prepareGreenfieldStore(ctx, c, logger)
+	if err != nil {
+		return err
+	}
+	if marker.Phase == greenfieldBootstrapReady {
+		return nil
+	}
+	if !marker.Claimed {
+		logger.Info(ctx, "Discarding incomplete owned metadata schema", "keyspace", c.Database.Keyspace, "phase", marker.Phase)
+		if err := resetGreenfieldStore(ctx, c, logger, marker); err != nil {
+			return err
+		}
+		marker, err = prepareGreenfieldStore(ctx, c, logger)
+		if err != nil {
+			return err
+		}
+		if marker.Phase != greenfieldBootstrapMigrating || !marker.Claimed {
+			return errors.Errorf("fresh metadata store was not claimed after reset: %+v", marker)
+		}
+	}
+
+	logger.Info(ctx, "Migrating schema", "keyspace", c.Database.Keyspace)
+	if err := migrateSchema(ctx, c, logger); err != nil {
+		return err
+	}
+	if err := finalizeGreenfieldStore(ctx, c, logger); err != nil {
+		return err
+	}
+	logger.Info(ctx, "Schema up to date", "keyspace", c.Database.Keyspace)
+	return nil
+}
+
+// prepareGreenfieldStore performs a read-only inventory before the first
+// secure schema mutation. A keyspace without our durable marker must contain
+// no user tables at all. The marker is written before ordinary migrations, so
+// a crash after any later DDL can safely resume without admitting an unrelated
+// or retained Manager metadata store.
+func prepareGreenfieldStore(ctx context.Context, c config.Config, logger log.Logger) (greenfieldBootstrapMarker, error) {
+	cluster := gocqlClusterConfigForDBInit(ctx, c, logger)
+	cluster.Keyspace = c.Database.Keyspace
+	session, err := cluster.CreateSession()
+	if err != nil {
+		return greenfieldBootstrapMarker{}, err
+	}
+	defer session.Close()
+
+	return prepareGreenfieldStoreSession(ctx, session, c.Database.Keyspace)
+}
+
+func finalizeGreenfieldStore(ctx context.Context, c config.Config, logger log.Logger) error {
+	cluster := gocqlClusterConfigForDBInit(ctx, c, logger)
+	cluster.Keyspace = c.Database.Keyspace
+	session, err := cluster.CreateSession()
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+
+	return finalizeGreenfieldStoreSession(ctx, session)
+}
+
+func prepareGreenfieldStoreSession(ctx context.Context, session *gocql.Session, keyspace string) (greenfieldBootstrapMarker, error) {
+	tables, err := userTables(ctx, session, keyspace)
+	if err != nil {
+		return greenfieldBootstrapMarker{}, err
+	}
+	_, markerTableExists := tables[greenfieldBootstrapTable]
+	if !markerTableExists {
+		if len(tables) != 0 {
+			return greenfieldBootstrapMarker{}, unownedGreenfieldSchemaError("table")
+		}
+		family, err := firstNonTableSchemaObject(ctx, session, keyspace)
+		if err != nil {
+			return greenfieldBootstrapMarker{}, err
+		}
+		if family != "" {
+			return greenfieldBootstrapMarker{}, unownedGreenfieldSchemaError(family)
+		}
+	}
+
+	if markerTableExists {
+		marker, readErr := readGreenfieldBootstrapMarker(ctx, session)
+		if readErr == nil {
+			return marker, validateGreenfieldBootstrapMarker(marker)
+		}
+		if !errors.Is(readErr, gocql.ErrNotFound) {
+			return greenfieldBootstrapMarker{}, errors.Wrap(readErr, "read secure metadata-store bootstrap marker")
+		}
+		// The sole marker table without its row is the only legitimate
+		// pre-marker crash state. Once ordinary migration tables exist, a
+		// missing marker can no longer prove greenfield ownership.
+		if !greenfieldMarkerTablesOnly(tables) {
+			return greenfieldBootstrapMarker{}, errors.New("secure metadata-store bootstrap marker is missing from a nonempty keyspace")
+		}
+		family, err := firstNonTableSchemaObject(ctx, session, keyspace)
+		if err != nil {
+			return greenfieldBootstrapMarker{}, err
+		}
+		if family != "" {
+			return greenfieldBootstrapMarker{}, errors.Errorf("secure metadata-store bootstrap marker is missing from a keyspace containing a %s", family)
+		}
+	}
+
+	if err := session.QueryWithContext(ctx, fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		bootstrap_id text PRIMARY KEY,
+		contract text,
+		bootstrap_phase text
+	)`, greenfieldBootstrapTable)).Exec(); err != nil {
+		return greenfieldBootstrapMarker{}, errors.Wrap(err, "create secure metadata-store bootstrap table")
+	}
+
+	q := session.QueryWithContext(ctx, fmt.Sprintf(
+		"INSERT INTO %s (bootstrap_id, contract, bootstrap_phase) VALUES (?, ?, ?) IF NOT EXISTS",
+		greenfieldBootstrapTable,
+	), greenfieldBootstrapID, greenfieldBootstrapContract, greenfieldBootstrapMigrating).
+		Consistency(gocql.All).
+		SerialConsistency(gocql.Serial).
+		Idempotent(true)
+	defer q.Release()
+	applied, casErr := q.MapScanCAS(map[string]interface{}{})
+	if casErr == nil && applied {
+		return greenfieldBootstrapMarker{Contract: greenfieldBootstrapContract, Phase: greenfieldBootstrapMigrating, Claimed: true}, nil
+	}
+
+	resolveCtx, cancel := greenfieldBootstrapResolutionContext(ctx)
+	defer cancel()
+	marker, readErr := readGreenfieldBootstrapMarker(resolveCtx, session)
+	if readErr == nil {
+		if err := validateGreenfieldBootstrapMarker(marker); err != nil {
+			return greenfieldBootstrapMarker{}, err
+		}
+		return marker, nil
+	}
+	if casErr != nil {
+		return greenfieldBootstrapMarker{}, errors.Wrapf(casErr, "write secure metadata-store bootstrap marker (resolution failed: %v)", readErr)
+	}
+	return greenfieldBootstrapMarker{}, errors.Wrap(readErr, "resolve secure metadata-store bootstrap marker")
+}
+
+func resetGreenfieldStore(ctx context.Context, c config.Config, logger log.Logger, marker greenfieldBootstrapMarker) error {
+	if marker.Contract != greenfieldBootstrapContract || marker.Phase == greenfieldBootstrapReady {
+		return errors.Errorf("refusing to reset metadata store with marker %+v", marker)
+	}
+	cluster := gocqlClusterConfigForDBInit(ctx, c, logger)
+	session, err := cluster.CreateSession()
+	if err != nil {
+		return err
+	}
+
+	qualifiedMarker := fmt.Sprintf("%q.%s", c.Database.Keyspace, greenfieldBootstrapTable)
+	if marker.Phase == greenfieldBootstrapMigrating {
+		q := session.QueryWithContext(ctx, fmt.Sprintf(
+			"UPDATE %s SET bootstrap_phase = ? WHERE bootstrap_id = ? IF contract = ? AND bootstrap_phase = ?",
+			qualifiedMarker,
+		), greenfieldBootstrapResetting, greenfieldBootstrapID, greenfieldBootstrapContract, greenfieldBootstrapMigrating).
+			Consistency(gocql.All).
+			SerialConsistency(gocql.Serial).
+			Idempotent(true)
+		applied, casErr := q.MapScanCAS(map[string]interface{}{})
+		q.Release()
+		if casErr != nil {
+			session.Close()
+			return errors.Wrap(casErr, "mark incomplete metadata store for reset")
+		}
+		if !applied {
+			var active greenfieldBootstrapMarker
+			readErr := session.QueryWithContext(ctx, fmt.Sprintf(
+				"SELECT contract, bootstrap_phase FROM %s WHERE bootstrap_id = ?",
+				qualifiedMarker,
+			), greenfieldBootstrapID).Consistency(gocql.Serial).Scan(&active.Contract, &active.Phase)
+			if readErr != nil || active.Contract != greenfieldBootstrapContract || active.Phase != greenfieldBootstrapResetting {
+				session.Close()
+				return errors.Wrapf(errors.New("metadata-store reset precondition changed"), "active marker: %+v; read error: %v", active, readErr)
+			}
+		}
+	}
+
+	var active greenfieldBootstrapMarker
+	if err := session.QueryWithContext(ctx, fmt.Sprintf(
+		"SELECT contract, bootstrap_phase FROM %s WHERE bootstrap_id = ?",
+		qualifiedMarker,
+	), greenfieldBootstrapID).Consistency(gocql.Serial).Scan(&active.Contract, &active.Phase); err != nil {
+		session.Close()
+		return errors.Wrap(err, "verify metadata-store reset marker")
+	}
+	if active.Contract != greenfieldBootstrapContract || active.Phase != greenfieldBootstrapResetting {
+		session.Close()
+		return errors.Errorf("refusing metadata-store reset with active marker %+v", active)
+	}
+	if err := session.QueryWithContext(ctx, fmt.Sprintf("DROP KEYSPACE IF EXISTS %q", c.Database.Keyspace)).Exec(); err != nil {
+		session.Close()
+		return errors.Wrap(err, "drop incomplete owned metadata keyspace")
+	}
+	session.Close()
+
+	if err := createKeyspace(ctx, c, logger); err != nil {
+		return errors.Wrap(err, "recreate clean metadata keyspace")
+	}
+	return nil
+}
+
+func unownedGreenfieldSchemaError(family string) error {
+	return errors.Errorf(
+		"metadata keyspace contains unowned Manager schema (%s); this secure Manager build requires a truly empty keyspace or its exact %s marker",
+		family, greenfieldBootstrapContract)
+}
+
+func greenfieldMarkerTablesOnly(tables map[string]struct{}) bool {
+	for name := range tables {
+		switch name {
+		case greenfieldBootstrapTable, greenfieldBootstrapTable + "$paxos":
+		default:
+			return false
+		}
+	}
+	_, ok := tables[greenfieldBootstrapTable]
+	return ok
+}
+
+func finalizeGreenfieldStoreSession(ctx context.Context, session *gocql.Session) error {
+	q := session.QueryWithContext(ctx, fmt.Sprintf(
+		"UPDATE %s SET bootstrap_phase = ? WHERE bootstrap_id = ? IF contract = ? AND bootstrap_phase = ?",
+		greenfieldBootstrapTable,
+	), greenfieldBootstrapReady, greenfieldBootstrapID, greenfieldBootstrapContract, greenfieldBootstrapMigrating).
+		Consistency(gocql.All).
+		SerialConsistency(gocql.Serial).
+		Idempotent(true)
+	defer q.Release()
+	applied, casErr := q.MapScanCAS(map[string]interface{}{})
+	if casErr == nil && applied {
+		return nil
+	}
+
+	resolveCtx, cancel := greenfieldBootstrapResolutionContext(ctx)
+	defer cancel()
+	marker, readErr := readGreenfieldBootstrapMarker(resolveCtx, session)
+	if readErr == nil && marker.Contract == greenfieldBootstrapContract && marker.Phase == greenfieldBootstrapReady {
+		return nil
+	}
+	if casErr != nil {
+		return errors.Wrapf(casErr, "finalize secure metadata-store bootstrap (resolution failed: %v)", readErr)
+	}
+	return errors.Wrapf(errors.New("secure metadata-store bootstrap marker changed unexpectedly"), "active marker: %+v; read error: %v", marker, readErr)
+}
+
+func userTables(ctx context.Context, session *gocql.Session, keyspace string) (map[string]struct{}, error) {
+	tables := make(map[string]struct{})
+	iter := session.QueryWithContext(ctx,
+		"SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?",
+		keyspace,
+	).Iter()
+	var name string
+	for iter.Scan(&name) {
+		tables[name] = struct{}{}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, errors.Wrap(err, "inspect metadata keyspace tables")
+	}
+	return tables, nil
+}
+
+func firstNonTableSchemaObject(ctx context.Context, session *gocql.Session, keyspace string) (string, error) {
+	families := []struct {
+		family string
+		table  string
+		column string
+	}{
+		{family: "user-defined type", table: "types", column: "type_name"},
+		{family: "function", table: "functions", column: "function_name"},
+		{family: "aggregate", table: "aggregates", column: "aggregate_name"},
+		{family: "materialized view", table: "views", column: "view_name"},
+		{family: "index", table: "indexes", column: "index_name"},
+		{family: "trigger", table: "triggers", column: "trigger_name"},
+	}
+	for _, f := range families {
+		var name string
+		err := session.QueryWithContext(ctx, fmt.Sprintf(
+			"SELECT %s FROM system_schema.%s WHERE keyspace_name = ? LIMIT 1",
+			f.column, f.table,
+		), keyspace).Scan(&name)
+		switch {
+		case err == nil:
+			return f.family, nil
+		case errors.Is(err, gocql.ErrNotFound):
+			continue
+		default:
+			return "", errors.Wrapf(err, "inspect metadata keyspace %s", f.family)
+		}
+	}
+	return "", nil
+}
+
+func readGreenfieldBootstrapMarker(ctx context.Context, session *gocql.Session) (greenfieldBootstrapMarker, error) {
+	var marker greenfieldBootstrapMarker
+	err := session.QueryWithContext(ctx, fmt.Sprintf(
+		"SELECT contract, bootstrap_phase FROM %s WHERE bootstrap_id = ?",
+		greenfieldBootstrapTable,
+	), greenfieldBootstrapID).
+		Consistency(gocql.Serial).
+		Scan(&marker.Contract, &marker.Phase)
+	return marker, err
+}
+
+func greenfieldBootstrapResolutionContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
+}
+
+func validateGreenfieldBootstrapMarker(marker greenfieldBootstrapMarker) error {
+	if marker.Contract != greenfieldBootstrapContract {
+		return errors.Errorf("metadata keyspace has incompatible secure bootstrap contract %q", marker.Contract)
+	}
+	switch marker.Phase {
+	case greenfieldBootstrapMigrating, greenfieldBootstrapResetting, greenfieldBootstrapReady:
+		return nil
+	default:
+		return errors.Errorf("metadata keyspace has invalid secure bootstrap phase %q", marker.Phase)
+	}
 }
 
 type dcInfo struct {
@@ -289,6 +637,7 @@ func gocqlClusterConfig(c config.Config) *gocql.ClusterConfig {
 	// SSL
 	if c.Database.SSL {
 		cluster.SslOpts = &gocql.SslOptions{
+			Config:                 &tls.Config{ServerName: c.SSL.ServerName, MinVersion: tls.VersionTLS12},
 			CaPath:                 c.SSL.CertFile,
 			CertPath:               c.SSL.UserCertFile,
 			KeyPath:                c.SSL.UserKeyFile,

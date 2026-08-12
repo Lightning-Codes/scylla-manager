@@ -138,6 +138,20 @@ func (mr *MockClusterServiceMockRecorder) DeleteCluster(arg0, arg1 interface{}) 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteCluster", reflect.TypeOf((*MockClusterService)(nil).DeleteCluster), arg0, arg1)
 }
 
+// DeleteConnectionSecrets mocks base method.
+func (m *MockClusterService) DeleteConnectionSecrets(arg0 context.Context, arg1 uuid.UUID, arg2 cluster.SecretDeletion) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeleteConnectionSecrets", arg0, arg1, arg2)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// DeleteConnectionSecrets indicates an expected call.
+func (mr *MockClusterServiceMockRecorder) DeleteConnectionSecrets(arg0, arg1, arg2 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteConnectionSecrets", reflect.TypeOf((*MockClusterService)(nil).DeleteConnectionSecrets), arg0, arg1, arg2)
+}
+
 // DeleteSSLUserCert mocks base method.
 func (m *MockClusterService) DeleteSSLUserCert(arg0 context.Context, arg1 uuid.UUID) error {
 	m.ctrl.T.Helper()

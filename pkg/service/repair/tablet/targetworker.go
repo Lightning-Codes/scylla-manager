@@ -52,5 +52,8 @@ func (w *targetWorker) getTarget(ctx context.Context) (Target, error) {
 		ksTabs[ks] = tabs
 	}
 
-	return Target{KsTabs: ksTabs}, nil
+	return Target{
+		KsTabs:               ksTabs,
+		connectionGeneration: w.client.Config().ConnectionGeneration,
+	}, nil
 }

@@ -13,15 +13,12 @@ import (
 	"github.com/scylladb/go-log"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/configcache"
-	"github.com/scylladb/scylla-manager/v3/pkg/util"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/scylladb/scylla-manager/v3/pkg/ping"
 	"github.com/scylladb/scylla-manager/v3/pkg/ping/cqlping"
 	"github.com/scylladb/scylla-manager/v3/pkg/ping/dynamoping"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
-	"github.com/scylladb/scylla-manager/v3/pkg/secrets"
-	"github.com/scylladb/scylla-manager/v3/pkg/store"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/parallel"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/uuid"
 )
@@ -30,14 +27,13 @@ import (
 type Service struct {
 	config          Config
 	scyllaClient    scyllaclient.ProviderFunc
-	secretsStore    store.Store
 	clusterProvider cluster.ProviderFunc
 	configCache     configcache.ConfigCacher
 
 	logger log.Logger
 }
 
-func NewService(config Config, scyllaClient scyllaclient.ProviderFunc, secretsStore store.Store,
+func NewService(config Config, scyllaClient scyllaclient.ProviderFunc,
 	clusterProvider cluster.ProviderFunc, configCache configcache.ConfigCacher, logger log.Logger,
 ) (*Service, error) {
 	if scyllaClient == nil {
@@ -47,7 +43,6 @@ func NewService(config Config, scyllaClient scyllaclient.ProviderFunc, secretsSt
 	return &Service{
 		config:          config,
 		scyllaClient:    scyllaClient,
-		secretsStore:    secretsStore,
 		clusterProvider: clusterProvider,
 		configCache:     configCache,
 		logger:          logger,
@@ -110,17 +105,18 @@ func (s *Service) Status(ctx context.Context, clusterID uuid.UUID) ([]NodeStatus
 	}
 
 	out := makeNodeStatus(status)
+	expectedGeneration := client.Config().ConnectionGeneration
 
 	g := new(errgroup.Group)
-	g.Go(s.parallelAlternatorPingFunc(ctx, clusterID, status, out))
-	g.Go(s.parallelCQLPingFunc(ctx, clusterID, status, out))
-	g.Go(s.parallelRESTPingFunc(ctx, clusterID, status, out))
-	g.Go(s.parallelNodeInfoFunc(ctx, clusterID, status, out))
+	g.Go(s.parallelAlternatorPingFunc(ctx, clusterID, expectedGeneration, status, out))
+	g.Go(s.parallelCQLPingFunc(ctx, clusterID, expectedGeneration, status, out))
+	g.Go(s.parallelRESTPingFunc(ctx, clusterID, expectedGeneration, status, out))
+	g.Go(s.parallelNodeInfoFunc(ctx, clusterID, expectedGeneration, status, out))
 
 	return out, g.Wait()
 }
 
-func (s *Service) parallelNodeInfoFunc(ctx context.Context, clusterID uuid.UUID, status scyllaclient.NodeStatusInfoSlice, out []NodeStatus) func() error {
+func (s *Service) parallelNodeInfoFunc(ctx context.Context, clusterID, expectedGeneration uuid.UUID, status scyllaclient.NodeStatusInfoSlice, out []NodeStatus) func() error {
 	return func() error {
 		return parallel.Run(len(status), parallel.NoLimit, func(i int) error {
 			// Ignore check if node is not Un and Normal
@@ -129,6 +125,9 @@ func (s *Service) parallelNodeInfoFunc(ctx context.Context, clusterID uuid.UUID,
 			}
 
 			ni, err := s.configCache.Read(clusterID, status[i].Addr)
+			if err == nil && ni.ConnectionGeneration != expectedGeneration {
+				err = errors.New("node configuration connection generation does not match status snapshot")
+			}
 			if err != nil {
 				s.logger.Error(ctx, "Node info fetch failed",
 					"cluster_id", clusterID,
@@ -136,7 +135,7 @@ func (s *Service) parallelNodeInfoFunc(ctx context.Context, clusterID uuid.UUID,
 					"error", err,
 				)
 			}
-			if ni.NodeInfo != nil {
+			if err == nil && ni.NodeInfo != nil {
 				s.decorateNodeStatus(&out[i], ni)
 			}
 			return nil
@@ -144,7 +143,7 @@ func (s *Service) parallelNodeInfoFunc(ctx context.Context, clusterID uuid.UUID,
 	}
 }
 
-func (s *Service) parallelRESTPingFunc(ctx context.Context, clusterID uuid.UUID, status scyllaclient.NodeStatusInfoSlice, out []NodeStatus) func() error {
+func (s *Service) parallelRESTPingFunc(ctx context.Context, clusterID, expectedGeneration uuid.UUID, status scyllaclient.NodeStatusInfoSlice, out []NodeStatus) func() error {
 	return func() error {
 		return parallel.Run(len(status), parallel.NoLimit, func(i int) error {
 			o := &out[i]
@@ -156,6 +155,9 @@ func (s *Service) parallelRESTPingFunc(ctx context.Context, clusterID uuid.UUID,
 
 			rtt := time.Duration(0)
 			ni, err := s.configCache.Read(clusterID, status[i].Addr)
+			if err == nil && ni.ConnectionGeneration != expectedGeneration {
+				err = errors.New("node configuration connection generation does not match status snapshot")
+			}
 			if err == nil {
 				rtt, err = s.pingREST(ctx, clusterID, status[i].Addr, s.config.MaxTimeout, ni)
 				// The proxied REST endpoint is protected by the Agent bearer
@@ -194,7 +196,7 @@ func (s *Service) parallelRESTPingFunc(ctx context.Context, clusterID uuid.UUID,
 	}
 }
 
-func (s *Service) parallelCQLPingFunc(ctx context.Context, clusterID uuid.UUID, status scyllaclient.NodeStatusInfoSlice, out []NodeStatus) func() error {
+func (s *Service) parallelCQLPingFunc(ctx context.Context, clusterID, expectedGeneration uuid.UUID, status scyllaclient.NodeStatusInfoSlice, out []NodeStatus) func() error {
 	return func() error {
 		return parallel.Run(len(status), parallel.NoLimit, func(i int) error {
 			o := &out[i]
@@ -207,6 +209,9 @@ func (s *Service) parallelCQLPingFunc(ctx context.Context, clusterID uuid.UUID, 
 			rtt := time.Duration(0)
 			authVerified := false
 			ni, err := s.configCache.Read(clusterID, status[i].Addr)
+			if err == nil && ni.ConnectionGeneration != expectedGeneration {
+				err = errors.New("node configuration connection generation does not match status snapshot")
+			}
 			if err == nil {
 				rtt, authVerified, err = s.pingCQLVerified(ctx, clusterID, status[i].Addr, s.config.MaxTimeout, ni)
 			}
@@ -245,7 +250,7 @@ func (s *Service) parallelCQLPingFunc(ctx context.Context, clusterID uuid.UUID, 
 	}
 }
 
-func (s *Service) parallelAlternatorPingFunc(ctx context.Context, clusterID uuid.UUID,
+func (s *Service) parallelAlternatorPingFunc(ctx context.Context, clusterID, expectedGeneration uuid.UUID,
 	status scyllaclient.NodeStatusInfoSlice, out []NodeStatus,
 ) func() error {
 	return func() error {
@@ -259,6 +264,9 @@ func (s *Service) parallelAlternatorPingFunc(ctx context.Context, clusterID uuid
 
 			rtt := time.Duration(0)
 			ni, err := s.configCache.Read(clusterID, status[i].Addr)
+			if err == nil && ni.ConnectionGeneration != expectedGeneration {
+				err = errors.New("node configuration connection generation does not match status snapshot")
+			}
 			if err == nil {
 				rtt, err = s.pingAlternator(ctx, clusterID, status[i].Addr, s.config.MaxTimeout, ni)
 			}
@@ -314,12 +322,11 @@ func (s *Service) pingAlternator(ctx context.Context, clusterID uuid.UUID, host 
 		return 0, errors.New("Alternator authentication requires verified TLS; refusing to transmit credentials over plaintext")
 	}
 	if config.RequiresAuthentication {
-		creds := &secrets.AlternatorCreds{ClusterID: clusterID}
-		if err := s.secretsStore.Get(creds); err != nil {
-			return 0, errors.Wrap(err, "load Alternator credentials")
+		if ni.AlternatorAccessKeyID == "" || ni.AlternatorSecretAccessKey == "" {
+			return 0, errors.New("load Alternator credentials: active connection generation has none")
 		}
 		config.Credentials = aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-			return aws.Credentials{AccessKeyID: creds.AccessKeyID, SecretAccessKey: creds.SecretAccessKey}, nil
+			return aws.Credentials{AccessKeyID: ni.AlternatorAccessKeyID, SecretAccessKey: ni.AlternatorSecretAccessKey}, nil
 		})
 	}
 
@@ -347,13 +354,9 @@ func (s *Service) pingCQLVerified(ctx context.Context, clusterID uuid.UUID, host
 	if ni.NodeInfo == nil {
 		return 0, false, errors.New("CQL node configuration is unavailable")
 	}
-	cluster, err := s.clusterProvider(ctx, clusterID)
-	if err != nil {
-		return 0, false, errors.Wrap(err, "cluster provider")
-	}
 	// Try to connect directly to host address.
 	config := cqlping.Config{
-		Addr:    ni.CQLAddr(host, cluster.ForceTLSDisabled || cluster.ForceNonSSLSessionPort),
+		Addr:    ni.CQLAddr(host, ni.ForceTLSDisabled || ni.ForceNonSSLSessionPort),
 		Timeout: timeout,
 	}
 
@@ -371,17 +374,16 @@ func (s *Service) pingCQLVerified(ctx context.Context, clusterID uuid.UUID, host
 		return rtt, false, err
 	}
 
-	credentials := &secrets.CQLCreds{ClusterID: clusterID}
-	credentialsErr := s.secretsStore.Get(credentials)
-	if ni.CqlPasswordProtected && credentialsErr != nil {
-		return 0, false, errors.Wrap(credentialsErr, "load required CQL credentials")
+	credentialsSet := ni.CQLUsername != "" || ni.CQLPassword != ""
+	if ni.CqlPasswordProtected && !credentialsSet {
+		return 0, false, errors.New("load required CQL credentials: active connection generation has none")
 	}
-	if credentialsErr == nil {
-		rtt, err = cqlping.QueryPing(ctx, config, credentials.Username, credentials.Password)
+	if credentialsSet {
+		if ni.CQLUsername == "" || ni.CQLPassword == "" {
+			return 0, false, errors.New("active connection generation has incomplete CQL credentials")
+		}
+		rtt, err = cqlping.QueryPing(ctx, config, ni.CQLUsername, ni.CQLPassword)
 		return rtt, cqlAuthenticationVerified(ni, tlsConfig != nil, err), err
-	}
-	if !errors.Is(credentialsErr, util.ErrNotFound) {
-		return 0, false, errors.Wrap(credentialsErr, "load CQL credentials")
 	}
 	logger := s.logger.With("cluster_id", clusterID, "host", host)
 	rtt, err = cqlping.NativeCQLPing(ctx, config, logger)
@@ -393,10 +395,13 @@ func cqlAuthenticationVerified(ni configcache.NodeConfig, tlsVerified bool, err 
 	return err == nil && tlsVerified && (ni.CqlPasswordProtected || ni.ClientEncryptionRequireAuth)
 }
 
-func (s *Service) pingREST(ctx context.Context, clusterID uuid.UUID, host string, timeout time.Duration, _ configcache.NodeConfig) (time.Duration, error) {
+func (s *Service) pingREST(ctx context.Context, clusterID uuid.UUID, host string, timeout time.Duration, ni configcache.NodeConfig) (time.Duration, error) {
 	client, err := s.scyllaClient(ctx, clusterID)
 	if err != nil {
 		return 0, errors.Wrapf(err, "get client for cluster with id %s", clusterID)
+	}
+	if client.Config().ConnectionGeneration != ni.ConnectionGeneration {
+		return 0, errors.New("Agent client and node configuration connection generations do not match")
 	}
 
 	return client.Ping(ctx, host, timeout)

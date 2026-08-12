@@ -8,12 +8,21 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/scylladb/scylla-manager/v3/pkg/util/uuid"
 	"go.uber.org/multierr"
 )
 
 // Config specifies the Client configuration.
 type Config struct {
 	TimeoutConfig
+
+	// ConnectionGeneration identifies the immutable Manager connection
+	// snapshot from which this client was constructed.
+	ConnectionGeneration uuid.UUID
+	// ConnectionLifecycleEpoch monotonically increases on cluster-ID deletion
+	// and never decreases. It lets the provider reject stale pre-delete
+	// validations for a permanently retired ID.
+	ConnectionLifecycleEpoch int64
 
 	// Transport scheme HTTP or HTTPS.
 	Scheme string `yaml:"scheme"`

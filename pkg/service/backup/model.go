@@ -62,7 +62,8 @@ type Target struct {
 	Method           Method                `json:"method,omitempty"`
 
 	// LiveNodes caches node status for GetTarget GetTargetSize calls.
-	liveNodes scyllaclient.NodeStatusInfoSlice `json:"-"`
+	liveNodes            scyllaclient.NodeStatusInfoSlice `json:"-"`
+	connectionGeneration uuid.UUID                        `json:"-"`
 }
 
 // RemoveSystemTables removes tables that belongs to system_schema since they are too version-mobile

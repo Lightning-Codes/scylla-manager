@@ -37,6 +37,7 @@ func (s *Service) InitTarget(ctx context.Context, clusterID uuid.UUID, target *T
 
 	// Get live nodes
 	target.liveNodes, err = s.getLiveNodes(ctx, client, target.DC)
+	target.connectionGeneration = client.Config().ConnectionGeneration
 	if target.Transfers == 0 {
 		target.Transfers = scyllaclient.TransfersFromConfig
 	}

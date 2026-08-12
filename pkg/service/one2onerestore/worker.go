@@ -28,11 +28,14 @@ import (
 
 type worker struct {
 	managerSession gocqlx.Session
+	// connectionGeneration binds every phase and nested repair handoff to the
+	// Agent/CQL snapshot assembled by newWorker.
+	connectionGeneration uuid.UUID
 
 	client         *scyllaclient.Client
 	clusterSession gocqlx.Session
 	sessionFunc    cluster.SessionFunc // is needed to create cql session to single host
-	repairSvc      *repair.Service
+	repairSvc      repairServicer
 
 	logger  log.Logger
 	metrics metrics.One2OneRestoreMetrics
@@ -40,6 +43,15 @@ type worker struct {
 	runInfo struct {
 		ClusterID, TaskID, RunID uuid.UUID
 	}
+}
+
+type repairServicer interface {
+	GetTarget(context.Context, uuid.UUID, json.RawMessage) (repair.Target, error)
+	Repair(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, repair.Target) error
+}
+
+func (w *worker) connectionContext(ctx context.Context) context.Context {
+	return cluster.WithExpectedConnectionGeneration(ctx, w.connectionGeneration)
 }
 
 func (w *worker) parseTarget(ctx context.Context, properties json.RawMessage) (Target, error) {
