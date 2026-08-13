@@ -25,6 +25,18 @@ func (w *worker) stageDropViews(ctx context.Context) error {
 	if err := aw.dropViews(ctx); err != nil {
 		return err
 	}
+	statements, err := baseColumnStatements(w.run.Views)
+	if err != nil {
+		return errors.Wrap(err, "derive Alternator GSI base columns")
+	}
+	for _, statement := range statements {
+		if err := w.clusterSession.ExecStmt(statement); err != nil {
+			return errors.Wrapf(err, "preserve Alternator GSI base column with statement %s", statement)
+		}
+	}
+	if len(statements) > 0 {
+		w.AwaitSchemaAgreement(ctx, w.clusterSession)
+	}
 
 	for _, v := range w.run.Views {
 		if aw.isAlternatorView(v) {

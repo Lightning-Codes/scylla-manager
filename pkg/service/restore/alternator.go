@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	stdErr "errors"
+	"fmt"
 	"slices"
 	"strings"
 
@@ -299,6 +300,72 @@ func (dw *alternatorDropViewsWorker) dropViews(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// baseColumnStatements returns the CQL statements needed to retain Alternator
+// GSI key attributes in the base-table schema while the indexes are absent.
+//
+// Scylla 2026.1 removes an Alternator GSI's dedicated base-table columns when
+// DeleteGlobalSecondaryIndex is applied. Restore intentionally drops indexes
+// before loading the base SSTables, but SSTables created by older releases
+// still encode those columns explicitly. Re-add the exact key columns before
+// the DATA stage so loading remains schema-compatible; the indexes themselves
+// are recreated by the normal RECREATE_VIEWS stage.
+func baseColumnStatements(views []View) ([]string, error) {
+	type column struct {
+		keyspace string
+		table    string
+		name     string
+		cqlType  string
+	}
+
+	columns := make(map[string]column)
+	for _, view := range views {
+		if view.Type != AlternatorGlobalSecondaryIndex {
+			continue
+		}
+		var update dynamodb.UpdateTableInput
+		if err := json.Unmarshal([]byte(view.CreateStmt), &update); err != nil {
+			return nil, errors.Wrapf(err, "unmarshal Alternator GSI %s.%s definition", view.Keyspace, view.View)
+		}
+		for _, definition := range update.AttributeDefinitions {
+			if definition.AttributeName == nil {
+				return nil, errors.Errorf("Alternator GSI %s.%s has an attribute without a name", view.Keyspace, view.View)
+			}
+			var cqlType string
+			switch definition.AttributeType {
+			case types.ScalarAttributeTypeS:
+				cqlType = "text"
+			case types.ScalarAttributeTypeN:
+				cqlType = "decimal"
+			case types.ScalarAttributeTypeB:
+				cqlType = "blob"
+			default:
+				return nil, errors.Errorf("Alternator GSI %s.%s attribute %q has unsupported type %q", view.Keyspace, view.View, *definition.AttributeName, definition.AttributeType)
+			}
+			key := view.Keyspace + "\x00" + view.BaseTable + "\x00" + *definition.AttributeName
+			candidate := column{keyspace: view.Keyspace, table: view.BaseTable, name: *definition.AttributeName, cqlType: cqlType}
+			if existing, ok := columns[key]; ok && existing.cqlType != candidate.cqlType {
+				return nil, errors.Errorf("Alternator GSI attribute %s.%s.%s has conflicting types %s and %s", candidate.keyspace, candidate.table, candidate.name, existing.cqlType, candidate.cqlType)
+			}
+			columns[key] = candidate
+		}
+	}
+
+	keys := make([]string, 0, len(columns))
+	for key := range columns {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	statements := make([]string, 0, len(keys))
+	for _, key := range keys {
+		c := columns[key]
+		statements = append(statements, fmt.Sprintf(
+			"ALTER TABLE %q.%q ADD IF NOT EXISTS %q %s",
+			c.keyspace, c.table, c.name, c.cqlType,
+		))
+	}
+	return statements, nil
 }
 
 func (dw *alternatorDropViewsWorker) viewToDeleteUpdate(view View) (types.GlobalSecondaryIndexUpdate, error) {
