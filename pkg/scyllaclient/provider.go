@@ -170,10 +170,32 @@ func (p *CachedProvider) ClientForGenerationValidatedEpoch(ctx context.Context, 
 		return nil, ErrClientClosed
 	}
 
-	if valid, err := c.isValid(ctx); err == nil && valid {
+	if c.client != nil {
+		// A connection generation is an immutable, explicitly revoked security
+		// snapshot. Long-running backup, restore, and repair workers retain the
+		// returned pointer for the duration of their run, so replacing and closing
+		// it merely because the generic cache TTL elapsed (or because a topology
+		// probe failed transiently) revokes an otherwise-authorized in-flight
+		// worker. Keep the same transport until an explicit generation rotation,
+		// cluster deletion, host-set change, or provider shutdown revokes it.
+		//
+		// Host discovery remains periodic. A proven host-set change is returned to
+		// the cluster service so it can commit a new immutable generation. A probe
+		// error is not proof that the active generation is invalid; the caller can
+		// continue using the already-authorized client and normal request retries.
+		if c.hostsTTL.Before(timeutc.Now()) {
+			changed, err := c.client.CheckHostsChanged(ctx)
+			switch {
+			case err != nil:
+				p.logger.Error(ctx, "Cannot refresh immutable-generation client topology; retaining active client", "error", err)
+				c.hostsTTL = timeutc.Now().Add(hostsValidity)
+			case changed:
+				return nil, ErrCachedHostsChanged
+			default:
+				c.hostsTTL = timeutc.Now().Add(hostsValidity)
+			}
+		}
 		return c.client, nil
-	} else if errors.Is(err, ErrCachedHostsChanged) {
-		return nil, err
 	}
 	previous := c.client
 	c.client = nil

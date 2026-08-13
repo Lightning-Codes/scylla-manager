@@ -108,6 +108,88 @@ func TestCachedProviderInvalidateRetainsStableCell(t *testing.T) {
 	}
 }
 
+func TestCachedProviderImmutableGenerationSurvivesGenericTTL(t *testing.T) {
+	id, generation := uuid.MustRandom(), uuid.MustRandom()
+	provider := NewCachedProvider(nil, time.Nanosecond, log.NewDevelopment())
+	provider.ResetCluster(id, generation)
+
+	created := 0
+	create := func() (*Client, error) {
+		created++
+		return generationTestClient(generation), nil
+	}
+	first, err := provider.ClientForGeneration(context.Background(), id, generation, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	second, err := provider.ClientForGeneration(context.Background(), id, generation, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second || created != 1 {
+		t.Fatalf("immutable generation was replaced after generic TTL: same=%v created=%d", first == second, created)
+	}
+	if first.transport.closed.Load() {
+		t.Fatal("outstanding immutable-generation client was revoked after generic TTL")
+	}
+}
+
+func TestCachedProviderImmutableGenerationSurvivesTransientTopologyProbe(t *testing.T) {
+	probeFails := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/storage_service/host_id" {
+			http.NotFound(w, r)
+			return
+		}
+		if probeFails {
+			http.Error(w, "transient", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, `[{"key":"127.0.0.1","value":"2938f381-882b-4da7-b94b-e78ad66a5ed4"}]`)
+	}))
+	defer server.Close()
+	host, port, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id, generation := uuid.MustRandom(), uuid.MustRandom()
+	config := TestConfig([]string{host}, "token")
+	config.Scheme = "http"
+	config.Port = port
+	config.ConnectionGeneration = generation
+	client, err := NewClient(config, log.NewDevelopment())
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := NewCachedProvider(nil, time.Hour, log.NewDevelopment())
+	provider.ResetCluster(id, generation)
+	create := func() (*Client, error) { return client, nil }
+	first, err := provider.ClientForGeneration(context.Background(), id, generation, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cell := provider.getGenerationClientTTL(id, generation)
+	cell.mu.Lock()
+	cell.hostsTTL = time.Time{}
+	cell.mu.Unlock()
+	probeFails = true
+	second, err := provider.ClientForGeneration(noRetry(context.Background()), id, generation, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second || first.transport.closed.Load() {
+		t.Fatal("transient topology probe revoked the active immutable-generation client")
+	}
+
+	probeFails = false
+	if _, err := first.HostIDs(noRetry(context.Background())); err != nil {
+		t.Fatalf("retained immutable-generation client is unusable: %v", err)
+	}
+}
+
 func TestCachedProviderRevokesEveryReplacedGeneration(t *testing.T) {
 	newClient := func() *Client {
 		transport := newRevocableTransport(http.DefaultTransport)

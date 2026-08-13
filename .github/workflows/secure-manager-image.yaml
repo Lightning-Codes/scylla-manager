@@ -100,7 +100,7 @@ jobs:
             ./pkg/cmd/sctool \
             ./schema
           go test -short -race -mod=vendor ./pkg/scyllaclient \
-            -run '^TestCachedProvider(InvalidateClosesIdleTransport|InvalidateRevokesOutstandingClient|InvalidateRetainsStableCell|RevokesEveryReplacedGeneration|HigherEpochCannotReopenRetiredClusterID|DelayedLowerEpochValidationCannotResurrect|IndeterminateDeleteCanHealFromFreshOldPointerProof|RetiresGenerationBeforeFirstAcquisition|RevokeClusterWinsPausedConstruction|ResetCannotReopenRevokedID|StaleValidationCannotResurrectRevokedCluster|AuthoritativeValidationObservesRemoteRotation)$'
+            -run '^TestCachedProvider(InvalidateClosesIdleTransport|InvalidateRevokesOutstandingClient|InvalidateRetainsStableCell|ImmutableGenerationSurvivesGenericTTL|ImmutableGenerationSurvivesTransientTopologyProbe|RevokesEveryReplacedGeneration|HigherEpochCannotReopenRetiredClusterID|DelayedLowerEpochValidationCannotResurrect|IndeterminateDeleteCanHealFromFreshOldPointerProof|RetiresGenerationBeforeFirstAcquisition|RevokeClusterWinsPausedConstruction|ResetCannotReopenRevokedID|StaleValidationCannotResurrectRevokedCluster|AuthoritativeValidationObservesRemoteRotation)$'
           go test -short -race -mod=vendor \
             ./pkg/service/cluster \
             ./pkg/service/configcache \
