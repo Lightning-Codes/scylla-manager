@@ -15,6 +15,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/pkg/errors"
 	"github.com/scylladb/go-log"
 	"github.com/scylladb/scylla-manager/backupspec"
@@ -55,7 +57,8 @@ func GetSchema(ctx context.Context, client *scyllaclient.Client, snapshotTag str
 	log.Info(ctx, "Found schema file path", "cql", cqlSchemaPath, "alternator", alternatorSchemaPath)
 
 	var cqlSchema query.DescribedSchema
-	if strings.HasSuffix(cqlSchemaPath, backupspec.UnsafeSchema) {
+	legacySchema := strings.HasSuffix(cqlSchemaPath, backupspec.UnsafeSchema)
+	if legacySchema {
 		cqlSchema, err = readLegacySchemaArchive(ctx, client, host, cqlSchemaPath)
 		if err != nil {
 			return nil, backupspec.AlternatorSchema{}, errors.Wrap(err, "read legacy cql schema archive")
@@ -79,9 +82,207 @@ func GetSchema(ctx context.Context, client *scyllaclient.Client, snapshotTag str
 		if err := json.Unmarshal(rawAlternatorSchema, &alternatorSchema); err != nil {
 			return nil, backupspec.AlternatorSchema{}, errors.Wrap(err, "unmarshal alternator schema")
 		}
+	} else if legacySchema {
+		alternatorSchema, err = deriveLegacyAlternatorSchema(cqlSchema)
+		if err != nil {
+			return nil, backupspec.AlternatorSchema{}, errors.Wrap(err, "derive legacy alternator schema")
+		}
 	}
 
 	return cqlSchema, alternatorSchema, nil
+}
+
+var legacyQuotedIdentifierRE = regexp.MustCompile(`"((?:""|[^"])*)"`)
+var legacyColumnDeclarationRE = regexp.MustCompile(`(?m)^\s*"((?:""|[^"])*)"\s+([A-Za-z]+)\b`)
+
+// deriveLegacyAlternatorSchema reconstructs the DynamoDB schema that Manager
+// 3.4 did not store separately. Alternator keyspaces with names that require
+// CQL quoting (for example a DynamoDB table containing '-') cannot be created
+// through CREATE KEYSPACE even when quoted; they must be created through the
+// Alternator API. The legacy DESCRIBE output contains the exact base and GSI
+// key definitions needed for that operation. Unsupported or ambiguous legacy
+// shapes fail closed instead of inventing a schema.
+func deriveLegacyAlternatorSchema(cql query.DescribedSchema) (backupspec.AlternatorSchema, error) {
+	var out backupspec.AlternatorSchema
+	for _, row := range cql {
+		keyspace := strings.Trim(row.Keyspace, `"`)
+		if !strings.HasPrefix(strings.ToLower(keyspace), "alternator_") {
+			continue
+		}
+		if row.Type != "legacy_keyspace" {
+			return backupspec.AlternatorSchema{}, errors.Errorf("alternator keyspace %q is not a legacy schema row", keyspace)
+		}
+		tableSchema, err := legacyAlternatorTableSchema(keyspace, row.CQLStmt)
+		if err != nil {
+			return backupspec.AlternatorSchema{}, errors.Wrapf(err, "keyspace %q", keyspace)
+		}
+		out.Tables = append(out.Tables, tableSchema)
+	}
+	slices.SortFunc(out.Tables, func(a, b backupspec.AlternatorTableSchema) int {
+		return strings.Compare(aws.ToString(a.Describe.TableName), aws.ToString(b.Describe.TableName))
+	})
+	return out, nil
+}
+
+func legacyAlternatorTableSchema(keyspace, cql string) (backupspec.AlternatorTableSchema, error) {
+	tableName := strings.TrimPrefix(keyspace, "alternator_")
+	if tableName == "" || tableName == keyspace {
+		return backupspec.AlternatorTableSchema{}, errors.New("invalid alternator keyspace prefix")
+	}
+	qualifiedBase := quoteLegacyIdentifier(keyspace) + "." + quoteLegacyIdentifier(tableName)
+
+	var baseStatement string
+	var viewStatements []string
+	for statement := range strings.SplitSeq(cql, ";") {
+		statement = strings.TrimSpace(statement)
+		upper := strings.ToUpper(statement)
+		switch {
+		case strings.HasPrefix(upper, "CREATE TABLE ") && strings.HasPrefix(strings.TrimSpace(statement[len("CREATE TABLE "):]), qualifiedBase+" "):
+			if baseStatement != "" {
+				return backupspec.AlternatorTableSchema{}, errors.New("multiple base table statements")
+			}
+			baseStatement = statement
+		case strings.HasPrefix(upper, "CREATE MATERIALIZED VIEW ") && strings.HasPrefix(strings.TrimSpace(statement[len("CREATE MATERIALIZED VIEW "):]), quoteLegacyIdentifier(keyspace)+`."`):
+			viewStatements = append(viewStatements, statement)
+		}
+	}
+	if baseStatement == "" {
+		return backupspec.AlternatorTableSchema{}, errors.Errorf("missing base table %s", qualifiedBase)
+	}
+
+	columnTypes := make(map[string]types.ScalarAttributeType)
+	for _, match := range legacyColumnDeclarationRE.FindAllStringSubmatch(baseStatement, -1) {
+		name := strings.ReplaceAll(match[1], `""`, `"`)
+		scalar, ok := legacyAlternatorScalarType(match[2])
+		if ok {
+			columnTypes[name] = scalar
+		}
+	}
+	baseKeys, err := legacyPrimaryKey(baseStatement)
+	if err != nil {
+		return backupspec.AlternatorTableSchema{}, errors.Wrap(err, "base primary key")
+	}
+	if len(baseKeys) < 1 || len(baseKeys) > 2 {
+		return backupspec.AlternatorTableSchema{}, errors.Errorf("base primary key has %d components", len(baseKeys))
+	}
+
+	keySchema := []types.KeySchemaElement{{AttributeName: aws.String(baseKeys[0]), KeyType: types.KeyTypeHash}}
+	if len(baseKeys) == 2 {
+		keySchema = append(keySchema, types.KeySchemaElement{AttributeName: aws.String(baseKeys[1]), KeyType: types.KeyTypeRange})
+	}
+	requiredAttributes := map[string]struct{}{baseKeys[0]: {}}
+	if len(baseKeys) == 2 {
+		requiredAttributes[baseKeys[1]] = struct{}{}
+	}
+
+	var indexes []types.GlobalSecondaryIndexDescription
+	for _, statement := range viewStatements {
+		name, err := legacyAlternatorViewName(statement, keyspace, tableName)
+		if err != nil {
+			return backupspec.AlternatorTableSchema{}, err
+		}
+		if !strings.Contains(strings.ToUpper(statement), "SELECT *") {
+			return backupspec.AlternatorTableSchema{}, errors.Errorf("GSI %q does not have an ALL projection", name)
+		}
+		keys, err := legacyPrimaryKey(statement)
+		if err != nil {
+			return backupspec.AlternatorTableSchema{}, errors.Wrapf(err, "GSI %q primary key", name)
+		}
+		if len(keys) < len(baseKeys)+1 || len(keys) > len(baseKeys)+2 || !slices.Equal(keys[len(keys)-len(baseKeys):], baseKeys) {
+			return backupspec.AlternatorTableSchema{}, errors.Errorf("GSI %q key does not end with the base key", name)
+		}
+		gsiKeys := keys[:len(keys)-len(baseKeys)]
+		gsiSchema := []types.KeySchemaElement{{AttributeName: aws.String(gsiKeys[0]), KeyType: types.KeyTypeHash}}
+		requiredAttributes[gsiKeys[0]] = struct{}{}
+		if len(gsiKeys) == 2 {
+			gsiSchema = append(gsiSchema, types.KeySchemaElement{AttributeName: aws.String(gsiKeys[1]), KeyType: types.KeyTypeRange})
+			requiredAttributes[gsiKeys[1]] = struct{}{}
+		}
+		indexes = append(indexes, types.GlobalSecondaryIndexDescription{
+			IndexName:  aws.String(name),
+			KeySchema:  gsiSchema,
+			Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+		})
+	}
+	slices.SortFunc(indexes, func(a, b types.GlobalSecondaryIndexDescription) int {
+		return strings.Compare(aws.ToString(a.IndexName), aws.ToString(b.IndexName))
+	})
+
+	attributeNames := slices.Collect(maps.Keys(requiredAttributes))
+	slices.Sort(attributeNames)
+	attributes := make([]types.AttributeDefinition, 0, len(attributeNames))
+	for _, name := range attributeNames {
+		t, ok := columnTypes[name]
+		if !ok {
+			return backupspec.AlternatorTableSchema{}, errors.Errorf("key attribute %q has no supported scalar type", name)
+		}
+		attributes = append(attributes, types.AttributeDefinition{AttributeName: aws.String(name), AttributeType: t})
+	}
+
+	return backupspec.AlternatorTableSchema{Describe: &types.TableDescription{
+		TableName:              aws.String(tableName),
+		AttributeDefinitions:   attributes,
+		KeySchema:              keySchema,
+		GlobalSecondaryIndexes: indexes,
+		BillingModeSummary:     &types.BillingModeSummary{BillingMode: types.BillingModePayPerRequest},
+	}}, nil
+}
+
+func legacyPrimaryKey(statement string) ([]string, error) {
+	upper := strings.ToUpper(statement)
+	start := strings.LastIndex(upper, "PRIMARY KEY")
+	if start < 0 {
+		return nil, errors.New("missing PRIMARY KEY")
+	}
+	rest := statement[start+len("PRIMARY KEY"):]
+	open := strings.IndexByte(rest, '(')
+	close := strings.IndexByte(rest, ')')
+	if open < 0 || close <= open {
+		return nil, errors.New("malformed PRIMARY KEY")
+	}
+	matches := legacyQuotedIdentifierRE.FindAllStringSubmatch(rest[open+1:close], -1)
+	if len(matches) == 0 {
+		return nil, errors.New("PRIMARY KEY contains no quoted identifiers")
+	}
+	keys := make([]string, 0, len(matches))
+	for _, match := range matches {
+		keys = append(keys, strings.ReplaceAll(match[1], `""`, `"`))
+	}
+	return keys, nil
+}
+
+func legacyAlternatorViewName(statement, keyspace, tableName string) (string, error) {
+	prefix := "CREATE MATERIALIZED VIEW " + quoteLegacyIdentifier(keyspace) + "."
+	if !strings.HasPrefix(strings.ToUpper(statement), strings.ToUpper(prefix)) {
+		return "", errors.New("malformed materialized view statement")
+	}
+	matches := legacyQuotedIdentifierRE.FindAllStringSubmatch(statement[len(prefix):], 1)
+	if len(matches) != 1 {
+		return "", errors.New("materialized view name is not quoted")
+	}
+	cqlName := strings.ReplaceAll(matches[0][1], `""`, `"`)
+	name, ok := strings.CutPrefix(cqlName, tableName+":")
+	if !ok || name == "" {
+		return "", errors.Errorf("view %q is not an Alternator GSI", cqlName)
+	}
+	return name, nil
+}
+
+func legacyAlternatorScalarType(cqlType string) (types.ScalarAttributeType, bool) {
+	switch strings.ToLower(cqlType) {
+	case "text", "ascii", "varchar":
+		return types.ScalarAttributeTypeS, true
+	case "blob":
+		return types.ScalarAttributeTypeB, true
+	case "bigint", "decimal", "double", "float", "int", "smallint", "tinyint", "varint":
+		return types.ScalarAttributeTypeN, true
+	default:
+		return "", false
+	}
+}
+
+func quoteLegacyIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
 }
 
 func getHostForLocation(ctx context.Context, client *scyllaclient.Client, loc backupspec.Location) (string, error) {

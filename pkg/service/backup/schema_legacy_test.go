@@ -98,6 +98,21 @@ CREATE MATERIALIZED VIEW alternator_sophena-main-prod.sophena-main-prod:GSI1 AS
 	if strings.Contains(got, "read_repair_chance") || !strings.Contains(got, "gc_grace_seconds = 864000") {
 		t.Fatalf("normalizer did not remove only obsolete read-repair options:\n%s", got)
 	}
+
+	alt, err := deriveLegacyAlternatorSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alt.Tables) != 1 || alt.Tables[0].Describe == nil {
+		t.Fatalf("unexpected derived Alternator schema: %#v", alt)
+	}
+	desc := alt.Tables[0].Describe
+	if desc.TableName == nil || *desc.TableName != "sophena-main-prod" || len(desc.KeySchema) != 2 || len(desc.GlobalSecondaryIndexes) != 1 {
+		t.Fatalf("unexpected derived table description: %#v", desc)
+	}
+	if desc.GlobalSecondaryIndexes[0].IndexName == nil || *desc.GlobalSecondaryIndexes[0].IndexName != "GSI1" || len(desc.AttributeDefinitions) != 4 {
+		t.Fatalf("unexpected derived GSI description: %#v", desc)
+	}
 }
 
 func TestParseLegacyAlternatorSchemaRejectsUnexpectedStatement(t *testing.T) {
