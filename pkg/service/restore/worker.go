@@ -90,6 +90,14 @@ func (w *worker) init(ctx context.Context, properties json.RawMessage) error {
 	if err := w.initUnits(ctx, w.target.locationInfo); err != nil {
 		return errors.Wrap(err, "init units")
 	}
+	// A schema file is authoritative for CQL-based schema restore. In
+	// particular, a backup created by an older Scylla release can contain
+	// system_schema SSTables which no longer exist in the target release.
+	// Those SSTables are kept in Units for size/progress reporting only; the
+	// CQL restore path neither loads them nor restores views separately.
+	if w.cqlSchema != nil {
+		return nil
+	}
 	return errors.Wrap(w.initViews(ctx), "init views")
 }
 
@@ -554,6 +562,29 @@ func (w *worker) initUnits(ctx context.Context, locationInfo []LocationInfo) err
 		return errors.New("no data in backup locations match given keyspace pattern")
 	}
 
+	if err := w.initUnitTableMetadata(ctx, units); err != nil {
+		return err
+	}
+
+	w.run.Units = units
+	w.logger.Info(ctx, "Initialized units", "units", units)
+
+	return nil
+}
+
+func (w *worker) initUnitTableMetadata(ctx context.Context, units []Unit) error {
+	if w.cqlSchema != nil {
+		for ui := range units {
+			for ti := range units[ui].Tables {
+				// CQL schema restore does not load the manifest's system_schema
+				// SSTables. Preserve the historical progress representation without
+				// coupling validation to a potentially different target catalog.
+				units[ui].Tables[ti].TombstoneGC = modeTimeout
+			}
+		}
+		return nil
+	}
+
 	tables, err := w.client.AllTables(ctx)
 	if err != nil {
 		return errors.Wrap(err, "get all tables")
@@ -576,10 +607,6 @@ func (w *worker) initUnits(ctx context.Context, locationInfo []LocationInfo) err
 			u.Tables[i].TombstoneGC = mode
 		}
 	}
-
-	w.run.Units = units
-	w.logger.Info(ctx, "Initialized units", "units", units)
-
 	return nil
 }
 
