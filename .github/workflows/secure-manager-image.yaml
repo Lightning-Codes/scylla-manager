@@ -160,6 +160,11 @@ jobs:
           go test -count=1 -race -tags integration -mod=vendor ./pkg/service/cluster \
             -run '^(TestConnectionGenerationLWTTwoWritersIntegration|TestSecureConnectionReadersObserveOnlyCompleteGenerationsIntegration|TestDeletedSecureClusterIDCannotBeRecreatedIntegration)$' \
             -cluster=127.0.0.1 -gocql.timeout=30s
+      - name: Prove supported idempotent Alternator GSI column CQL
+        run: |
+          go test -count=1 -race -tags integration -mod=vendor ./pkg/service/restore \
+            -run '^TestEnsureAlternatorBaseColumnsUsesSupportedIdempotentCQLIntegration$' \
+            -cluster=127.0.0.1 -gocql.timeout=30s
       - name: Collect Scylla logs
         if: always()
         run: docker logs secure-manager-scylla

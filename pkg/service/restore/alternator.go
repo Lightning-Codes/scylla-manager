@@ -311,15 +311,23 @@ func (dw *alternatorDropViewsWorker) dropViews(ctx context.Context) error {
 // still encode those columns explicitly. Re-add the exact key columns before
 // the DATA stage so loading remains schema-compatible; the indexes themselves
 // are recreated by the normal RECREATE_VIEWS stage.
-func baseColumnStatements(views []View) ([]string, error) {
-	type column struct {
-		keyspace string
-		table    string
-		name     string
-		cqlType  string
-	}
+type alternatorBaseColumn struct {
+	keyspace string
+	table    string
+	name     string
+	cqlType  string
+}
 
-	columns := make(map[string]column)
+func (c alternatorBaseColumn) addStatement() string {
+	return fmt.Sprintf(
+		"ALTER TABLE %q.%q ADD %q %s",
+		c.keyspace, c.table, c.name, c.cqlType,
+	)
+}
+
+func baseColumns(views []View) ([]alternatorBaseColumn, error) {
+
+	columns := make(map[string]alternatorBaseColumn)
 	for _, view := range views {
 		if view.Type != AlternatorGlobalSecondaryIndex {
 			continue
@@ -344,7 +352,7 @@ func baseColumnStatements(views []View) ([]string, error) {
 				return nil, errors.Errorf("Alternator GSI %s.%s attribute %q has unsupported type %q", view.Keyspace, view.View, *definition.AttributeName, definition.AttributeType)
 			}
 			key := view.Keyspace + "\x00" + view.BaseTable + "\x00" + *definition.AttributeName
-			candidate := column{keyspace: view.Keyspace, table: view.BaseTable, name: *definition.AttributeName, cqlType: cqlType}
+			candidate := alternatorBaseColumn{keyspace: view.Keyspace, table: view.BaseTable, name: *definition.AttributeName, cqlType: cqlType}
 			if existing, ok := columns[key]; ok && existing.cqlType != candidate.cqlType {
 				return nil, errors.Errorf("Alternator GSI attribute %s.%s.%s has conflicting types %s and %s", candidate.keyspace, candidate.table, candidate.name, existing.cqlType, candidate.cqlType)
 			}
@@ -357,15 +365,11 @@ func baseColumnStatements(views []View) ([]string, error) {
 		keys = append(keys, key)
 	}
 	slices.Sort(keys)
-	statements := make([]string, 0, len(keys))
+	result := make([]alternatorBaseColumn, 0, len(keys))
 	for _, key := range keys {
-		c := columns[key]
-		statements = append(statements, fmt.Sprintf(
-			"ALTER TABLE %q.%q ADD IF NOT EXISTS %q %s",
-			c.keyspace, c.table, c.name, c.cqlType,
-		))
+		result = append(result, columns[key])
 	}
-	return statements, nil
+	return result, nil
 }
 
 func (dw *alternatorDropViewsWorker) viewToDeleteUpdate(view View) (types.GlobalSecondaryIndexUpdate, error) {

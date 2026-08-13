@@ -20,14 +20,18 @@ func TestBaseColumnStatements(t *testing.T) {
 		{Keyspace: "ks", BaseTable: "base", View: "mv", Type: MaterializedView, CreateStmt: "ignored"},
 	}
 
-	got, err := baseColumnStatements(views)
+	columns, err := baseColumns(views)
 	if err != nil {
 		t.Fatal(err)
 	}
+	got := make([]string, 0, len(columns))
+	for _, column := range columns {
+		got = append(got, column.addStatement())
+	}
 	want := []string{
-		`ALTER TABLE "alternator_app"."events" ADD IF NOT EXISTS "B" blob`,
-		`ALTER TABLE "alternator_app"."events" ADD IF NOT EXISTS "N" decimal`,
-		`ALTER TABLE "alternator_app"."events" ADD IF NOT EXISTS "S" text`,
+		`ALTER TABLE "alternator_app"."events" ADD "B" blob`,
+		`ALTER TABLE "alternator_app"."events" ADD "N" decimal`,
+		`ALTER TABLE "alternator_app"."events" ADD "S" text`,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("statements = %#v, want %#v", got, want)
@@ -39,7 +43,7 @@ func TestBaseColumnStatementsRejectsConflictingType(t *testing.T) {
 		{Keyspace: "ks", BaseTable: "t", View: "t:GSI1", Type: AlternatorGlobalSecondaryIndex, CreateStmt: `{"AttributeDefinitions":[{"AttributeName":"K","AttributeType":"S"}]}`},
 		{Keyspace: "ks", BaseTable: "t", View: "t:GSI2", Type: AlternatorGlobalSecondaryIndex, CreateStmt: `{"AttributeDefinitions":[{"AttributeName":"K","AttributeType":"N"}]}`},
 	}
-	if _, err := baseColumnStatements(views); err == nil {
+	if _, err := baseColumns(views); err == nil {
 		t.Fatal("expected conflicting type error")
 	}
 }

@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/gocql/gocql"
 	"github.com/pkg/errors"
+	"github.com/scylladb/gocqlx/v2"
 	"github.com/scylladb/scylla-manager/v3/pkg/metrics"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 	"golang.org/x/sync/errgroup"
@@ -25,16 +27,15 @@ func (w *worker) stageDropViews(ctx context.Context) error {
 	if err := aw.dropViews(ctx); err != nil {
 		return err
 	}
-	statements, err := baseColumnStatements(w.run.Views)
+	columns, err := baseColumns(w.run.Views)
 	if err != nil {
 		return errors.Wrap(err, "derive Alternator GSI base columns")
 	}
-	for _, statement := range statements {
-		if err := w.clusterSession.ExecStmt(statement); err != nil {
-			return errors.Wrapf(err, "preserve Alternator GSI base column with statement %s", statement)
-		}
+	changed, err := ensureAlternatorBaseColumns(ctx, w.clusterSession, columns)
+	if err != nil {
+		return err
 	}
-	if len(statements) > 0 {
+	if changed {
 		w.AwaitSchemaAgreement(ctx, w.clusterSession)
 	}
 
@@ -48,6 +49,40 @@ func (w *worker) stageDropViews(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func ensureAlternatorBaseColumns(ctx context.Context, session gocqlx.Session, columns []alternatorBaseColumn) (bool, error) {
+	changed := false
+	for _, column := range columns {
+		var existingType string
+		err := session.Session.Query(
+			"SELECT type FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ? AND column_name = ?",
+			column.keyspace, column.table, column.name,
+		).WithContext(ctx).Scan(&existingType)
+		switch {
+		case err == nil:
+			if existingType != column.cqlType {
+				return false, errors.Errorf(
+					"Alternator GSI base column %s.%s.%s has type %s, expected %s",
+					column.keyspace, column.table, column.name, existingType, column.cqlType,
+				)
+			}
+			continue
+		case errors.Is(err, gocql.ErrNotFound):
+			// Scylla does not support ADD IF NOT EXISTS for table columns.
+			// Preflight the schema so retries remain idempotent without relying
+			// on unsupported CQL syntax.
+		case err != nil:
+			return false, errors.Wrapf(err, "read Alternator GSI base column %s.%s.%s", column.keyspace, column.table, column.name)
+		}
+
+		statement := column.addStatement()
+		if err := session.ExecStmt(statement); err != nil {
+			return false, errors.Wrapf(err, "preserve Alternator GSI base column with statement %s", statement)
+		}
+		changed = true
+	}
+	return changed, nil
 }
 
 func (w *worker) stageRecreateViews(ctx context.Context) error {
