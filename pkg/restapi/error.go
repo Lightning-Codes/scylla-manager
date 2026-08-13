@@ -61,6 +61,9 @@ func respondError(w http.ResponseWriter, r *http.Request, err error, details ...
 			TraceID:    log.TraceID(r.Context()),
 		})
 	default:
+		if logger, ok := r.Context().Value(loggerContextKey{}).(log.Logger); ok {
+			logger.Error(r.Context(), "Request failed", "error", err)
+		}
 		render.Respond(w, r, &httpError{
 			StatusCode: http.StatusInternalServerError,
 			Details:    strings.Join(details, "\n\n"),

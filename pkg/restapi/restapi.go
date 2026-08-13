@@ -3,6 +3,7 @@
 package restapi
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 
@@ -15,6 +16,8 @@ import (
 	"github.com/scylladb/scylla-manager/v3/pkg/util/httplog"
 )
 
+type loggerContextKey struct{}
+
 func init() {
 	render.Respond = responder
 }
@@ -26,6 +29,7 @@ func New(services Services, logger log.Logger) http.Handler {
 	r.Use(
 		interactive,
 		httplog.TraceID,
+		withLogger(logger),
 		httplog.RequestLogger(logger),
 		render.SetContentType(render.ContentTypeJSON),
 		middleware.Recoverer,
@@ -55,6 +59,15 @@ func New(services Services, logger log.Logger) http.Handler {
 	})
 
 	return r
+}
+
+func withLogger(logger log.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := context.WithValue(r.Context(), loggerContextKey{}, logger)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
 }
 
 func interactive(next http.Handler) http.Handler {

@@ -2,6 +2,7 @@
 package restapi
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,9 +11,25 @@ import (
 	"github.com/gocql/gocql"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
+	"github.com/scylladb/go-log"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/util"
 )
+
+func TestRespondErrorLogsInternalCauseWithoutLeakingIt(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request = request.WithContext(context.WithValue(request.Context(), loggerContextKey{}, log.NewDevelopment()))
+	response := httptest.NewRecorder()
+
+	respondError(response, request, errors.New("catalog parse failed"))
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if strings.Contains(response.Body.String(), "catalog parse failed") {
+		t.Fatal("internal cause leaked to API response")
+	}
+}
 
 func TestRespondError(t *testing.T) {
 	request, _ := http.NewRequest(http.MethodGet, "/", nil)
