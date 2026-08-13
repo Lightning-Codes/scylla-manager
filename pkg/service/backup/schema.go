@@ -3,6 +3,7 @@
 package backup
 
 import (
+	"archive/tar"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -51,13 +52,20 @@ func GetSchema(ctx context.Context, client *scyllaclient.Client, snapshotTag str
 	}
 	log.Info(ctx, "Found schema file path", "cql", cqlSchemaPath, "alternator", alternatorSchemaPath)
 
-	rawCQLSchema, err := readRawSchemaFile(ctx, client, host, cqlSchemaPath)
-	if err != nil {
-		return nil, backupspec.AlternatorSchema{}, errors.Wrap(err, "read cql schema file")
-	}
 	var cqlSchema query.DescribedSchema
-	if err := json.Unmarshal(rawCQLSchema, &cqlSchema); err != nil {
-		return nil, backupspec.AlternatorSchema{}, errors.Wrap(err, "unmarshal cql schema")
+	if strings.HasSuffix(cqlSchemaPath, backupspec.UnsafeSchema) {
+		cqlSchema, err = readLegacySchemaArchive(ctx, client, host, cqlSchemaPath)
+		if err != nil {
+			return nil, backupspec.AlternatorSchema{}, errors.Wrap(err, "read legacy cql schema archive")
+		}
+	} else {
+		rawCQLSchema, err := readRawSchemaFile(ctx, client, host, cqlSchemaPath)
+		if err != nil {
+			return nil, backupspec.AlternatorSchema{}, errors.Wrap(err, "read cql schema file")
+		}
+		if err := json.Unmarshal(rawCQLSchema, &cqlSchema); err != nil {
+			return nil, backupspec.AlternatorSchema{}, errors.Wrap(err, "unmarshal cql schema")
+		}
 	}
 
 	var alternatorSchema backupspec.AlternatorSchema
@@ -115,6 +123,7 @@ func getSchemaFilePath(ctx context.Context, client *scyllaclient.Client, host st
 	}
 
 	var parseErr error
+	var legacyCQLSchemaPath string
 	for _, entry := range entries {
 		entryTaskID, entryTag, err := ParseSchemaFileName(entry.Name)
 		if err != nil {
@@ -135,6 +144,12 @@ func getSchemaFilePath(ctx context.Context, client *scyllaclient.Client, host st
 			}
 			cqlSchemaPath = entry.Path
 		}
+		if strings.HasSuffix(entry.Name, backupspec.UnsafeSchema) {
+			if legacyCQLSchemaPath != "" {
+				return "", "", errors.Errorf("multiple legacy cql schema files found (%s, %s)", legacyCQLSchemaPath, entry.Path)
+			}
+			legacyCQLSchemaPath = entry.Path
+		}
 		if strings.HasSuffix(entry.Name, backupspec.AlternatorSchemaFileSuffix) {
 			if alternatorSchemaPath != "" {
 				return "", "", errors.Errorf("multiple alternator schema files found (%s, %s)", alternatorSchemaPath, entry.Path)
@@ -143,6 +158,9 @@ func getSchemaFilePath(ctx context.Context, client *scyllaclient.Client, host st
 		}
 	}
 	// CQL schema should always be backed up, alternator schema is optional
+	if cqlSchemaPath == "" {
+		cqlSchemaPath = legacyCQLSchemaPath
+	}
 	if cqlSchemaPath == "" {
 		if parseErr != nil {
 			return "", "", stdErr.Join(ErrSchemaFileNotFound, errors.Wrap(parseErr, "parse cql schema file name"))
@@ -198,7 +216,95 @@ func cutSchemaFileSuffix(name string) (string, bool) {
 	if name, ok := strings.CutSuffix(name, backupspec.AlternatorSchemaFileSuffix); ok {
 		return name, true
 	}
+	if name, ok := strings.CutSuffix(name, backupspec.UnsafeSchema); ok {
+		return name, true
+	}
 	return name, false
+}
+
+const (
+	maxLegacySchemaEntries   = 1024
+	maxLegacySchemaEntrySize = 16 << 20
+)
+
+var legacyKeyspaceNameRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// readLegacySchemaArchive converts Manager 3.4's schema.tar.gz backup format
+// into schema rows understood by the current restore worker. Legacy archives
+// contain one CQL file per keyspace. System keyspaces are deliberately ignored:
+// a greenfield restore must retain the target cluster's auth, topology, Raft,
+// and system schema rather than importing those from the retired source ring.
+func readLegacySchemaArchive(ctx context.Context, client *scyllaclient.Client, host, schemaFilePath string) (schema query.DescribedSchema, err error) {
+	r, err := client.RcloneOpen(ctx, host, schemaFilePath)
+	if err != nil {
+		return nil, errors.Wrap(err, "open legacy schema archive")
+	}
+	defer func() {
+		err = stdErr.Join(err, errors.Wrap(r.Close(), "close legacy schema archive reader"))
+	}()
+
+	gzr, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, errors.Wrap(err, "create legacy schema gzip reader")
+	}
+	defer func() {
+		err = stdErr.Join(err, errors.Wrap(gzr.Close(), "close legacy schema gzip reader"))
+	}()
+
+	return parseLegacySchemaArchive(ctx, gzr)
+}
+
+func parseLegacySchemaArchive(ctx context.Context, r io.Reader) (query.DescribedSchema, error) {
+	var schema query.DescribedSchema
+	tr := tar.NewReader(r)
+	entries := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "read legacy schema archive entry")
+		}
+		entries++
+		if entries > maxLegacySchemaEntries {
+			return nil, errors.Errorf("legacy schema archive exceeds %d entries", maxLegacySchemaEntries)
+		}
+		if h.Typeflag != tar.TypeReg || h.Name != path.Base(h.Name) || !strings.HasSuffix(h.Name, ".cql") {
+			return nil, errors.Errorf("unsafe legacy schema archive entry %q", h.Name)
+		}
+		if h.Size < 0 || h.Size > maxLegacySchemaEntrySize {
+			return nil, errors.Errorf("legacy schema archive entry %q has invalid size %d", h.Name, h.Size)
+		}
+
+		keyspace := strings.TrimSuffix(h.Name, ".cql")
+		if !legacyKeyspaceNameRE.MatchString(keyspace) {
+			return nil, errors.Errorf("unsafe legacy schema keyspace name %q", keyspace)
+		}
+		if strings.HasPrefix(strings.ToLower(keyspace), "system") {
+			continue
+		}
+		raw, err := io.ReadAll(io.LimitReader(tr, maxLegacySchemaEntrySize+1))
+		if err != nil {
+			return nil, errors.Wrapf(err, "read legacy schema archive entry %q", h.Name)
+		}
+		if len(raw) == 0 || len(raw) > maxLegacySchemaEntrySize {
+			return nil, errors.Errorf("legacy schema archive entry %q has invalid content size %d", h.Name, len(raw))
+		}
+		schema = append(schema, query.DescribedSchemaRow{
+			Keyspace: keyspace,
+			Type:     "legacy_keyspace",
+			Name:     keyspace,
+			CQLStmt:  string(raw),
+		})
+	}
+	if len(schema) == 0 {
+		return nil, errors.New("legacy schema archive contains no user keyspace")
+	}
+	return schema, nil
 }
 
 // readRawSchemaFile fetches and decompresses schema file from the backup location.

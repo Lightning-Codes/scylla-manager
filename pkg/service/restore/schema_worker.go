@@ -180,13 +180,16 @@ func (w *schemaWorker) restoreFromSchemaFile(ctx context.Context) error {
 		}
 		// Sometimes a single object might require multiple CQL statements (e.g. table with dropped and added column)
 		for _, stmt := range parseCQLStatement(row.CQLStmt) {
+			if row.Type == "legacy_keyspace" && isLegacyGeneratedCDCLogStatement(stmt) {
+				continue
+			}
 			if err := w.clusterSession.ExecStmt(stmt); err != nil {
 				if dropErr := dropKeyspaces(createdKs, w.clusterSession); dropErr != nil {
 					w.logger.Error(ctx, "Couldn't rollback already applied schema changes", "error", dropErr)
 				}
 				return errors.Wrapf(err, "create %s (%s) with %s", row.Name, row.Keyspace, stmt)
 			}
-			if row.Type == "keyspace" {
+			if row.Type == "keyspace" || (row.Type == "legacy_keyspace" && strings.HasPrefix(strings.ToUpper(stmt), "CREATE KEYSPACE ")) {
 				createdKs = append(createdKs, row.Name)
 			}
 		}
@@ -372,6 +375,11 @@ func parseCQLStatement(cql string) []string {
 		}
 	}
 	return out
+}
+
+func isLegacyGeneratedCDCLogStatement(stmt string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(stmt))
+	return strings.HasPrefix(upper, "CREATE TABLE ") && strings.Contains(strings.ToLower(stmt), "_scylla_cdc_log")
 }
 
 func dropKeyspaces(keyspaces []string, session gocqlx.Session) error {

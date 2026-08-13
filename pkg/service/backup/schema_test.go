@@ -44,6 +44,12 @@ func TestParseSchemaFileName(t *testing.T) {
 			taskID:     uuid.MustParse("1702a53a-2ecd-44b2-9c79-c45653a49d31"),
 			tag:        "sm_20250527161648UTC",
 		},
+		{
+			name:       "valid legacy cql schema archive",
+			schemaFile: "task_1702a53a-2ecd-44b2-9c79-c45653a49d31_tag_sm_20250527161648UTC_schema.tar.gz",
+			taskID:     uuid.MustParse("1702a53a-2ecd-44b2-9c79-c45653a49d31"),
+			tag:        "sm_20250527161648UTC",
+		},
 	}
 
 	for _, tc := range testCases {
