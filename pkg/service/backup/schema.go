@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	stdErr "errors"
 	"io"
+	"maps"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -294,17 +296,158 @@ func parseLegacySchemaArchive(ctx context.Context, r io.Reader) (query.Described
 		if len(raw) == 0 || len(raw) > maxLegacySchemaEntrySize {
 			return nil, errors.Errorf("legacy schema archive entry %q has invalid content size %d", h.Name, len(raw))
 		}
+		cql := string(raw)
+		if strings.HasPrefix(strings.ToLower(keyspace), "alternator_") {
+			cql, err = normalizeLegacyAlternatorSchema(keyspace, cql)
+			if err != nil {
+				return nil, errors.Wrapf(err, "normalize legacy Alternator schema entry %q", h.Name)
+			}
+		}
 		schema = append(schema, query.DescribedSchemaRow{
 			Keyspace: keyspace,
 			Type:     "legacy_keyspace",
 			Name:     keyspace,
-			CQLStmt:  string(raw),
+			CQLStmt:  cql,
 		})
 	}
 	if len(schema) == 0 {
 		return nil, errors.New("legacy schema archive contains no user keyspace")
 	}
 	return schema, nil
+}
+
+var legacyAlternatorColumnDeclarationRE = regexp.MustCompile(`(?m)^\s*([A-Za-z_:][A-Za-z0-9_:$-]*)\s+(?:text|blob|int|tinyint|bigint|timeuuid|boolean|map<|frozen<)`)
+var legacyRemovedReadRepairOptionRE = regexp.MustCompile(`(?m)^\s+AND (?:dclocal_read_repair_chance|read_repair_chance)\s*=\s*[^;\r\n]+(?:\r?\n|$)`)
+
+func normalizeLegacyAlternatorSchema(keyspace, cql string) (string, error) {
+	identifiers := map[string]struct{}{keyspace: {}}
+	for _, match := range legacyAlternatorColumnDeclarationRE.FindAllStringSubmatch(cql, -1) {
+		identifiers[match[1]] = struct{}{}
+	}
+
+	for statement := range strings.SplitSeq(cql, ";") {
+		statement = strings.TrimSpace(statement)
+		if statement == "" {
+			continue
+		}
+		upper := strings.ToUpper(statement)
+		switch {
+		case strings.HasPrefix(upper, "CREATE KEYSPACE "):
+			if !strings.HasPrefix(strings.TrimSpace(statement[len("CREATE KEYSPACE "):]), keyspace) {
+				return "", errors.Errorf("CREATE KEYSPACE does not match archive keyspace %q", keyspace)
+			}
+		case strings.HasPrefix(upper, "CREATE TABLE "):
+			name, err := legacyAlternatorObjectName(statement[len("CREATE TABLE "):], keyspace)
+			if err != nil {
+				return "", err
+			}
+			if name != "" {
+				identifiers[name] = struct{}{}
+			}
+		case strings.HasPrefix(upper, "CREATE MATERIALIZED VIEW "):
+			name, err := legacyAlternatorObjectName(statement[len("CREATE MATERIALIZED VIEW "):], keyspace)
+			if err != nil {
+				return "", err
+			}
+			if name != "" {
+				identifiers[name] = struct{}{}
+			}
+		default:
+			return "", errors.Errorf("unsupported statement in legacy Alternator schema: %.64s", statement)
+		}
+	}
+
+	tokens := slices.Collect(maps.Keys(identifiers))
+	slices.SortFunc(tokens, func(a, b string) int { return len(b) - len(a) })
+	for _, token := range tokens {
+		cql = quoteLegacyCQLToken(cql, token)
+	}
+	// Scylla 2026.1 no longer accepts the legacy read-repair chance table
+	// options emitted by 5.4 DESCRIBE output. Both were already inert at zero
+	// in the source schema, so removing them preserves behavior exactly.
+	cql = legacyRemovedReadRepairOptionRE.ReplaceAllString(cql, "")
+	return cql, nil
+}
+
+func legacyAlternatorObjectName(value, keyspace string) (string, error) {
+	value = strings.TrimSpace(value)
+	prefix := keyspace + "."
+	if strings.HasPrefix(value, `"`+keyspace+`".`) {
+		return "", nil
+	}
+	if !strings.HasPrefix(value, prefix) {
+		return "", errors.Errorf("schema object does not belong to archive keyspace %q", keyspace)
+	}
+	value = value[len(prefix):]
+	end := strings.IndexAny(value, " \t\r\n(")
+	if end < 0 {
+		end = len(value)
+	}
+	if end == 0 {
+		return "", errors.New("legacy Alternator schema object name is empty")
+	}
+	return value[:end], nil
+}
+
+func quoteLegacyCQLToken(cql, token string) string {
+	if token == "" {
+		return cql
+	}
+	var out strings.Builder
+	out.Grow(len(cql) + 32)
+	for i := 0; i < len(cql); {
+		switch cql[i] {
+		case '\'':
+			start := i
+			i++
+			for i < len(cql) {
+				if cql[i] == '\'' {
+					i++
+					if i < len(cql) && cql[i] == '\'' {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+			out.WriteString(cql[start:i])
+		case '"':
+			start := i
+			i++
+			for i < len(cql) {
+				if cql[i] == '"' {
+					i++
+					if i < len(cql) && cql[i] == '"' {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+			out.WriteString(cql[start:i])
+		default:
+			if strings.HasPrefix(cql[i:], token) && legacyCQLTokenBoundary(cql, i-1) && legacyCQLTokenBoundary(cql, i+len(token)) {
+				out.WriteByte('"')
+				out.WriteString(strings.ReplaceAll(token, `"`, `""`))
+				out.WriteByte('"')
+				i += len(token)
+				continue
+			}
+			out.WriteByte(cql[i])
+			i++
+		}
+	}
+	return out.String()
+}
+
+func legacyCQLTokenBoundary(value string, index int) bool {
+	if index < 0 || index >= len(value) {
+		return true
+	}
+	b := value[index]
+	return !((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || strings.ContainsRune("_:$-", rune(b)))
 }
 
 // readRawSchemaFile fetches and decompresses schema file from the backup location.
